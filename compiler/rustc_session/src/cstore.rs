@@ -73,6 +73,7 @@ pub struct NativeLib {
     pub wasm_import_module: Option<Symbol>,
     pub verbatim: Option<bool>,
     pub dll_imports: Vec<DllImport>,
+    pub link_arg: Option<String>,
 }
 
 #[derive(Clone, Debug, Encodable, Decodable, HashStable_Generic)]

@@ -345,6 +345,7 @@ fn link_rlib<'a, B: ArchiveBuilder<'a>>(
             | NativeLibKind::Dylib { .. }
             | NativeLibKind::Framework { .. }
             | NativeLibKind::RawDylib
+            | NativeLibKind::LinkArg
             | NativeLibKind::Unspecified => continue,
         }
         if let Some(name) = lib.name {
@@ -1289,6 +1290,7 @@ fn print_native_static_libs(sess: &Session, all_native_libs: &[NativeLib]) {
                     // ld-only syntax, since there are no frameworks in MSVC
                     Some(format!("-framework {}", name))
                 }
+                NativeLibKind::LinkArg => Some(lib.link_arg.as_ref()?.to_string()),
                 // These are included, no need to print them
                 NativeLibKind::Static { bundle: None | Some(true), .. }
                 | NativeLibKind::RawDylib => None,
@@ -2076,6 +2078,10 @@ fn add_local_native_libraries(
                 // FIXME(#58713): Proper handling for raw dylibs.
                 bug!("raw_dylib feature not yet implemented");
             }
+            NativeLibKind::LinkArg => {
+                let link_arg = lib.link_arg.as_ref().unwrap();
+                cmd.cmd().arg(link_arg);
+            }
         }
     }
 }
@@ -2427,6 +2433,7 @@ fn add_upstream_native_libraries(
                 // add_upstream_rust_crates
                 NativeLibKind::Static { .. } => {}
                 NativeLibKind::RawDylib => {}
+                NativeLibKind::LinkArg => {}
             }
         }
     }

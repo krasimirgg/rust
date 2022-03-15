@@ -55,6 +55,7 @@ impl<'tcx> ItemLikeVisitor<'tcx> for Collector<'tcx> {
                 wasm_import_module: None,
                 verbatim: None,
                 dll_imports: Vec::new(),
+                link_arg: None,
             };
             let mut kind_specified = false;
 
@@ -362,6 +363,7 @@ impl Collector<'_> {
                     wasm_import_module: None,
                     verbatim: passed_lib.verbatim,
                     dll_imports: Vec::new(),
+                    link_arg: passed_lib.link_arg.clone(),
                 };
                 self.register_native_lib(None, lib);
             } else {

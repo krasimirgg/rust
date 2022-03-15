@@ -39,6 +39,8 @@ pub enum NativeLibKind {
         /// Whether the framework will be linked only if it satifies some undefined symbols
         as_needed: Option<bool>,
     },
+    /// Raw linker argument.
+    LinkArg,
     /// The library kind wasn't specified, `Dylib` is currently used as a default.
     Unspecified,
 }
@@ -47,10 +49,12 @@ rustc_data_structures::impl_stable_hash_via_hash!(NativeLibKind);
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Encodable, Decodable)]
 pub struct NativeLib {
+    // Name of the lib or empty for NativeLibKind::LinkArg.
     pub name: String,
     pub new_name: Option<String>,
     pub kind: NativeLibKind,
     pub verbatim: Option<bool>,
+    pub link_arg: Option<String>,
 }
 
 rustc_data_structures::impl_stable_hash_via_hash!(NativeLib);

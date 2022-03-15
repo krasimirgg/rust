@@ -1880,6 +1880,22 @@ fn parse_native_lib_kind(
             }
             NativeLibKind::Static { bundle: Some(false), whole_archive: None }
         }
+        "link-arg" => {
+            if modifiers.is_some() {
+                early_error(
+                    error_format,
+                    "linking modifier can't be used with library kind `link-arg`",
+                )
+            }
+            if !is_nightly {
+                early_error(
+                    error_format,
+                    "library kind `link-arg` is currently unstable and only accepted on \
+                the nightly compiler",
+                );
+            }
+            NativeLibKind::LinkArg
+        }
         s => early_error(
             error_format,
             &format!("unknown library kind `{}`, expected one of dylib, framework, or static", s),
@@ -1974,8 +1990,8 @@ fn parse_libs(matches: &getopts::Matches, error_format: ErrorOutputType) -> Vec<
         .into_iter()
         .map(|s| {
             // Parse string of the form "[KIND[:MODIFIERS]=]lib[:new_name]",
-            // where KIND is one of "dylib", "framework", "static" and
-            // where MODIFIERS are  a comma separated list of supported modifiers
+            // where KIND is one of "dylib", "framework", "static", "link-arg" and
+            // where MODIFIERS are a comma separated list of supported modifiers
             // (bundle, verbatim, whole-archive, as-needed). Each modifier is prefixed
             // with either + or - to indicate whether it is enabled or disabled.
             // The last value specified for a given modifier wins.
@@ -1987,11 +2003,14 @@ fn parse_libs(matches: &getopts::Matches, error_format: ErrorOutputType) -> Vec<
                 }
             };
 
-            let (name, new_name) = match name.split_once(':') {
-                None => (name, None),
-                Some((name, new_name)) => (name.to_string(), Some(new_name.to_owned())),
+            let (name, new_name, link_arg) = match kind {
+                NativeLibKind::LinkArg => ("".to_string(), None, Some(name.to_string())),
+                _ => match name.split_once(':') {
+                    None => (name, None, None),
+                    Some((name, new_name)) => (name.to_string(), Some(new_name.to_owned()), None),
+                },
             };
-            NativeLib { name, new_name, kind, verbatim }
+            NativeLib { name, new_name, kind, verbatim, link_arg }
         })
         .collect()
 }

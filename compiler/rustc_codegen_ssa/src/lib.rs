@@ -113,6 +113,7 @@ pub struct NativeLib {
     pub cfg: Option<ast::MetaItem>,
     pub verbatim: Option<bool>,
     pub dll_imports: Vec<cstore::DllImport>,
+    pub link_arg: Option<String>,
 }
 
 impl From<&cstore::NativeLib> for NativeLib {
@@ -123,6 +124,7 @@ impl From<&cstore::NativeLib> for NativeLib {
             cfg: lib.cfg.clone(),
             verbatim: lib.verbatim,
             dll_imports: lib.dll_imports.clone(),
+            link_arg: lib.link_arg.clone(),
         }
     }
 }
