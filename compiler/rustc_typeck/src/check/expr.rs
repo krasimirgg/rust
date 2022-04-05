@@ -26,12 +26,13 @@ use rustc_ast as ast;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_data_structures::stack::ensure_sufficient_stack;
 use rustc_errors::Diagnostic;
-use rustc_errors::ErrorReported;
+use rustc_errors::ErrorGuaranteed;
 use rustc_errors::{pluralize, struct_span_err, Applicability, DiagnosticBuilder, DiagnosticId};
 use rustc_hir as hir;
 use rustc_hir::def::{CtorKind, DefKind, Res};
 use rustc_hir::def_id::DefId;
 use rustc_hir::intravisit::Visitor;
+use rustc_hir::lang_items::LangItem;
 use rustc_hir::{ExprKind, HirId, QPath};
 use rustc_infer::infer;
 use rustc_infer::infer::type_variable::{TypeVariableOrigin, TypeVariableOriginKind};
@@ -43,7 +44,6 @@ use rustc_middle::ty::error::TypeError::{FieldMisMatch, Sorts};
 use rustc_middle::ty::subst::SubstsRef;
 use rustc_middle::ty::{self, AdtKind, Ty, TypeFoldable};
 use rustc_session::parse::feature_err;
-use rustc_span::edition::LATEST_STABLE_EDITION;
 use rustc_span::hygiene::DesugaringKind;
 use rustc_span::lev_distance::find_best_match_for_name;
 use rustc_span::source_map::Span;
@@ -590,7 +590,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 let opt_coerce_to = {
                     // We should release `enclosing_breakables` before the `check_expr_with_hint`
                     // below, so can't move this block of code to the enclosing scope and share
-                    // `ctxt` with the second `encloding_breakables` borrow below.
+                    // `ctxt` with the second `enclosing_breakables` borrow below.
                     let mut enclosing_breakables = self.enclosing_breakables.borrow_mut();
                     match enclosing_breakables.opt_find_breakable(target_id) {
                         Some(ctxt) => ctxt.coerce.as_ref().map(|coerce| coerce.expected_ty()),
@@ -668,7 +668,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 // else an error would have been flagged by the
                 // `loops` pass for using break with an expression
                 // where you are not supposed to.
-                assert!(expr_opt.is_none() || self.tcx.sess.has_errors());
+                assert!(expr_opt.is_none() || self.tcx.sess.has_errors().is_some());
             }
 
             // If we encountered a `break`, then (no surprise) it may be possible to break from the
@@ -793,7 +793,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         self.tcx.types.never
     }
 
-    /// `explicit_return` is `true` if we're checkng an explicit `return expr`,
+    /// `explicit_return` is `true` if we're checking an explicit `return expr`,
     /// and `false` if we're checking a trailing expression.
     pub(super) fn check_return_expr(
         &self,
@@ -965,8 +965,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             };
             let else_diverges = self.diverges.get();
 
-            let opt_suggest_box_span =
-                self.opt_suggest_box_span(else_expr.span, else_ty, orig_expected);
+            let opt_suggest_box_span = self.opt_suggest_box_span(else_ty, orig_expected);
             let if_cause =
                 self.if_cause(sp, then_expr, else_expr, then_ty, else_ty, opt_suggest_box_span);
 
@@ -1127,7 +1126,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         let method = match self.lookup_method(rcvr_t, segment, span, expr, rcvr, args) {
             Ok(method) => {
                 // We could add a "consider `foo::<params>`" suggestion here, but I wasn't able to
-                // trigger this codepath causing `structuraly_resolved_type` to emit an error.
+                // trigger this codepath causing `structurally_resolved_type` to emit an error.
 
                 self.write_method_call(expr.hir_id, method);
                 Ok(method)
@@ -1188,7 +1187,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     deferred_cast_checks.push(cast_check);
                     t_cast
                 }
-                Err(ErrorReported) => self.tcx.ty_error(),
+                Err(_) => self.tcx.ty_error(),
             }
         }
     }
@@ -1334,7 +1333,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
 
         // Prohibit struct expressions when non-exhaustive flag is set.
         let adt = adt_ty.ty_adt_def().expect("`check_struct_path` returned non-ADT type");
-        if !adt.did.is_local() && variant.is_field_list_non_exhaustive() {
+        if !adt.did().is_local() && variant.is_field_list_non_exhaustive() {
             self.tcx
                 .sess
                 .emit_err(StructExprNonExhaustive { span: expr.span, what: adt.variant_descr() });
@@ -1557,7 +1556,14 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             if inaccessible_remaining_fields {
                 self.report_inaccessible_fields(adt_ty, span);
             } else {
-                self.report_missing_fields(adt_ty, span, remaining_fields);
+                self.report_missing_fields(
+                    adt_ty,
+                    span,
+                    remaining_fields,
+                    variant,
+                    ast_fields,
+                    substs,
+                );
             }
         }
     }
@@ -1591,6 +1597,9 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         adt_ty: Ty<'tcx>,
         span: Span,
         remaining_fields: FxHashMap<Ident, (usize, &ty::FieldDef)>,
+        variant: &'tcx ty::VariantDef,
+        ast_fields: &'tcx [hir::ExprField<'tcx>],
+        substs: SubstsRef<'tcx>,
     ) {
         let len = remaining_fields.len();
 
@@ -1616,7 +1625,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             }
         };
 
-        struct_span_err!(
+        let mut err = struct_span_err!(
             self.tcx.sess,
             span,
             E0063,
@@ -1625,9 +1634,48 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             remaining_fields_names,
             truncated_fields_error,
             adt_ty
-        )
-        .span_label(span, format!("missing {}{}", remaining_fields_names, truncated_fields_error))
-        .emit();
+        );
+        err.span_label(
+            span,
+            format!("missing {}{}", remaining_fields_names, truncated_fields_error),
+        );
+
+        // If the last field is a range literal, but it isn't supposed to be, then they probably
+        // meant to use functional update syntax.
+        //
+        // I don't use 'is_range_literal' because only double-sided, half-open ranges count.
+        if let Some((
+            last,
+            ExprKind::Struct(
+                QPath::LangItem(LangItem::Range, ..),
+                &[ref range_start, ref range_end],
+                _,
+            ),
+        )) = ast_fields.last().map(|last| (last, &last.expr.kind)) &&
+        let variant_field =
+            variant.fields.iter().find(|field| field.ident(self.tcx) == last.ident) &&
+        let range_def_id = self.tcx.lang_items().range_struct() &&
+        variant_field
+            .and_then(|field| field.ty(self.tcx, substs).ty_adt_def())
+            .map(|adt| adt.did())
+            != range_def_id
+        {
+            let instead = self
+                .tcx
+                .sess
+                .source_map()
+                .span_to_snippet(range_end.expr.span)
+                .map(|s| format!(" from `{s}`"))
+                .unwrap_or(String::new());
+            err.span_suggestion(
+                range_start.span.shrink_to_hi(),
+                &format!("to set the remaining fields{instead}, separate the last named field with a comma"),
+                ",".to_string(),
+                Applicability::MaybeIncorrect,
+            );
+        }
+
+        err.emit();
     }
 
     /// Report an error for a struct field expression when there are invisible fields.
@@ -1864,7 +1912,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 ty::Adt(base_def, substs) if !base_def.is_enum() => {
                     debug!("struct named {:?}", base_t);
                     let (ident, def_scope) =
-                        self.tcx.adjust_ident_and_get_scope(field, base_def.did, self.body_id);
+                        self.tcx.adjust_ident_and_get_scope(field, base_def.did(), self.body_id);
                     let fields = &base_def.non_enum_variant().fields;
                     if let Some(index) = fields
                         .iter()
@@ -1883,7 +1931,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                             self.tcx.check_stability(field.did, Some(expr.hir_id), expr.span, None);
                             return field_ty;
                         }
-                        private_candidate = Some((adjustments, base_def.did, field_ty));
+                        private_candidate = Some((adjustments, base_def.did(), field_ty));
                     }
                 }
                 ty::Tuple(tys) => {
@@ -2010,8 +2058,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             // We know by construction that `<expr>.await` is either on Rust 2015
             // or results in `ExprKind::Await`. Suggest switching the edition to 2018.
             err.note("to `.await` a `Future`, switch to Rust 2018 or later");
-            err.help(&format!("set `edition = \"{}\"` in `Cargo.toml`", LATEST_STABLE_EDITION));
-            err.note("for more on editions, read https://doc.rust-lang.org/edition-guide");
+            err.help_use_latest_edition();
         }
 
         err.emit();
@@ -2105,9 +2152,9 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
 
             if let ty::RawPtr(ty_and_mut) = expr_t.kind() {
                 if let ty::Adt(adt_def, _) = ty_and_mut.ty.kind() {
-                    if adt_def.variants.len() == 1
+                    if adt_def.variants().len() == 1
                         && adt_def
-                            .variants
+                            .variants()
                             .iter()
                             .next()
                             .unwrap()
@@ -2156,7 +2203,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     fn suggest_fields_on_recordish(
         &self,
         err: &mut Diagnostic,
-        def: &'tcx ty::AdtDef,
+        def: ty::AdtDef<'tcx>,
         field: Ident,
         access_span: Span,
     ) {
@@ -2225,7 +2272,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         field: Ident,
         expr_t: Ty<'tcx>,
         id: HirId,
-    ) -> DiagnosticBuilder<'_, ErrorReported> {
+    ) -> DiagnosticBuilder<'_, ErrorGuaranteed> {
         let span = field.span;
         debug!("no_such_field_err(span: {:?}, field: {:?}, expr_t: {:?})", span, field, expr_t);
 

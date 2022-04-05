@@ -2,7 +2,7 @@ use crate::diagnostics::{ImportSuggestion, LabelSuggestion, TypoSuggestion};
 use crate::late::lifetimes::{ElisionFailureInfo, LifetimeContext};
 use crate::late::{AliasPossibility, LateResolutionVisitor, RibKind};
 use crate::path_names_to_string;
-use crate::{CrateLint, Module, ModuleKind, ModuleOrUniformRoot};
+use crate::{Finalize, Module, ModuleKind, ModuleOrUniformRoot};
 use crate::{PathResult, PathSource, Segment};
 
 use rustc_ast::visit::FnKind;
@@ -13,7 +13,8 @@ use rustc_ast::{
 use rustc_ast_pretty::pprust::path_segment_to_string;
 use rustc_data_structures::fx::FxHashSet;
 use rustc_errors::{
-    pluralize, struct_span_err, Applicability, Diagnostic, DiagnosticBuilder, ErrorReported,
+    pluralize, struct_span_err, Applicability, Diagnostic, DiagnosticBuilder, ErrorGuaranteed,
+    MultiSpan,
 };
 use rustc_hir as hir;
 use rustc_hir::def::Namespace::{self, *};
@@ -25,7 +26,7 @@ use rustc_span::edition::Edition;
 use rustc_span::hygiene::MacroKind;
 use rustc_span::lev_distance::find_best_match_for_name;
 use rustc_span::symbol::{kw, sym, Ident, Symbol};
-use rustc_span::{BytePos, MultiSpan, Span, DUMMY_SP};
+use rustc_span::{BytePos, Span, DUMMY_SP};
 
 use std::iter;
 use std::ops::Deref;
@@ -135,7 +136,7 @@ impl<'a: 'ast, 'ast> LateResolutionVisitor<'a, '_, 'ast> {
         span: Span,
         source: PathSource<'_>,
         res: Option<Res>,
-    ) -> (DiagnosticBuilder<'a, ErrorReported>, Vec<ImportSuggestion>) {
+    ) -> (DiagnosticBuilder<'a, ErrorGuaranteed>, Vec<ImportSuggestion>) {
         let ident_span = path.last().map_or(span, |ident| ident.ident.span);
         let ns = source.namespace();
         let is_expected = &|res| source.is_expected(res);
@@ -187,12 +188,11 @@ impl<'a: 'ast, 'ast> LateResolutionVisitor<'a, '_, 'ast> {
                 (String::new(), "the crate root".to_string())
             } else {
                 let mod_path = &path[..path.len() - 1];
-                let mod_prefix =
-                    match self.resolve_path(mod_path, Some(TypeNS), false, span, CrateLint::No) {
-                        PathResult::Module(ModuleOrUniformRoot::Module(module)) => module.res(),
-                        _ => None,
-                    }
-                    .map_or_else(String::new, |res| format!("{} ", res.descr()));
+                let mod_prefix = match self.resolve_path(mod_path, Some(TypeNS), Finalize::No) {
+                    PathResult::Module(ModuleOrUniformRoot::Module(module)) => module.res(),
+                    _ => None,
+                }
+                .map_or_else(String::new, |res| format!("{} ", res.descr()));
                 (mod_prefix, format!("`{}`", Segment::names_to_string(mod_path)))
             };
             (
@@ -232,7 +232,7 @@ impl<'a: 'ast, 'ast> LateResolutionVisitor<'a, '_, 'ast> {
             _ => {}
         }
 
-        let is_assoc_fn = self.self_type_is_available(span);
+        let is_assoc_fn = self.self_type_is_available();
         // Emit help message for fake-self from other languages (e.g., `this` in Javascript).
         if ["this", "my"].contains(&item_str.as_str()) && is_assoc_fn {
             err.span_suggestion_short(
@@ -241,7 +241,7 @@ impl<'a: 'ast, 'ast> LateResolutionVisitor<'a, '_, 'ast> {
                 "self".to_string(),
                 Applicability::MaybeIncorrect,
             );
-            if !self.self_value_is_available(path[0].ident.span, span) {
+            if !self.self_value_is_available(path[0].ident.span) {
                 if let Some((FnKind::Fn(_, _, sig, ..), fn_span)) =
                     &self.diagnostic_metadata.current_function
                 {
@@ -402,9 +402,9 @@ impl<'a: 'ast, 'ast> LateResolutionVisitor<'a, '_, 'ast> {
                 );
             }
         }
-        if path.len() == 1 && self.self_type_is_available(span) {
+        if path.len() == 1 && self.self_type_is_available() {
             if let Some(candidate) = self.lookup_assoc_candidate(ident, ns, is_expected) {
-                let self_is_available = self.self_value_is_available(path[0].ident.span, span);
+                let self_is_available = self.self_value_is_available(path[0].ident.span);
                 match candidate {
                     AssocSuggestion::Field => {
                         if self_is_available {
@@ -461,7 +461,7 @@ impl<'a: 'ast, 'ast> LateResolutionVisitor<'a, '_, 'ast> {
         }
 
         // Try Levenshtein algorithm.
-        let typo_sugg = self.lookup_typo_candidate(path, ns, is_expected, span);
+        let typo_sugg = self.lookup_typo_candidate(path, ns, is_expected);
         // Try context-dependent help if relaxed lookup didn't work.
         if let Some(res) = res {
             if self.smart_resolve_context_dependent_help(
@@ -504,9 +504,9 @@ impl<'a: 'ast, 'ast> LateResolutionVisitor<'a, '_, 'ast> {
                     for sp in spans {
                         let msg = if sp == last_bound_span {
                             format!(
-                                "...because of {} bound{}",
-                                if bounds.len() <= 2 { "this" } else { "these" },
-                                if bounds.len() <= 2 { "" } else { "s" },
+                                "...because of {these} bound{s}",
+                                these = pluralize!("this", bounds.len() - 1),
+                                s = pluralize!(bounds.len() - 1),
                             )
                         } else {
                             String::new()
@@ -562,7 +562,7 @@ impl<'a: 'ast, 'ast> LateResolutionVisitor<'a, '_, 'ast> {
                 }
 
                 // If the trait has a single item (which wasn't matched by Levenshtein), suggest it
-                let suggestion = self.get_single_associated_item(&path, span, &source, is_expected);
+                let suggestion = self.get_single_associated_item(&path, &source, is_expected);
                 self.r.add_typo_suggestion(&mut err, suggestion, ident_span);
             }
             if fallback {
@@ -641,14 +641,13 @@ impl<'a: 'ast, 'ast> LateResolutionVisitor<'a, '_, 'ast> {
     fn get_single_associated_item(
         &mut self,
         path: &[Segment],
-        span: Span,
         source: &PathSource<'_>,
         filter_fn: &impl Fn(Res) -> bool,
     ) -> Option<TypoSuggestion> {
         if let crate::PathSource::TraitItem(_) = source {
             let mod_path = &path[..path.len() - 1];
             if let PathResult::Module(ModuleOrUniformRoot::Module(module)) =
-                self.resolve_path(mod_path, None, false, span, CrateLint::No)
+                self.resolve_path(mod_path, None, Finalize::No)
             {
                 let resolutions = self.r.resolutions(module).borrow();
                 let targets: Vec<_> =
@@ -698,15 +697,7 @@ impl<'a: 'ast, 'ast> LateResolutionVisitor<'a, '_, 'ast> {
         ) = &bounded_ty.kind
         {
             // use this to verify that ident is a type param.
-            let Ok(Some(partial_res)) = self.resolve_qpath_anywhere(
-                bounded_ty.id,
-                None,
-                &Segment::from_path(path),
-                Namespace::TypeNS,
-                span,
-                true,
-                CrateLint::No,
-            ) else {
+            let Some(partial_res) = self.r.partial_res_map.get(&bounded_ty.id) else {
                 return false;
             };
             if !(matches!(
@@ -721,17 +712,10 @@ impl<'a: 'ast, 'ast> LateResolutionVisitor<'a, '_, 'ast> {
             return false;
         };
 
-        if let ast::TyKind::Path(None, type_param_path) = &ty.peel_refs().kind {
+        let peeled_ty = ty.peel_refs();
+        if let ast::TyKind::Path(None, type_param_path) = &peeled_ty.kind {
             // Confirm that the `SelfTy` is a type parameter.
-            let Ok(Some(partial_res)) = self.resolve_qpath_anywhere(
-                bounded_ty.id,
-                None,
-                &Segment::from_path(type_param_path),
-                Namespace::TypeNS,
-                span,
-                true,
-                CrateLint::No,
-            ) else {
+            let Some(partial_res) = self.r.partial_res_map.get(&peeled_ty.id) else {
                 return false;
             };
             if !(matches!(
@@ -1123,7 +1107,7 @@ impl<'a: 'ast, 'ast> LateResolutionVisitor<'a, '_, 'ast> {
                         .collect();
 
                     if non_visible_spans.len() > 0 {
-                        let mut m: rustc_span::MultiSpan = non_visible_spans.clone().into();
+                        let mut m: MultiSpan = non_visible_spans.clone().into();
                         non_visible_spans
                             .into_iter()
                             .for_each(|s| m.push_span_label(s, "private field".to_string()));
@@ -1156,7 +1140,7 @@ impl<'a: 'ast, 'ast> LateResolutionVisitor<'a, '_, 'ast> {
                         }
                         err.span_suggestion(
                             span,
-                            &"use this syntax instead",
+                            "use this syntax instead",
                             path_str.to_string(),
                             Applicability::MaybeIncorrect,
                         );
@@ -1292,8 +1276,7 @@ impl<'a: 'ast, 'ast> LateResolutionVisitor<'a, '_, 'ast> {
                 ident,
                 ns,
                 &self.parent_scope,
-                false,
-                module.span,
+                None,
             ) {
                 let res = binding.res();
                 if filter_fn(res) {
@@ -1323,7 +1306,6 @@ impl<'a: 'ast, 'ast> LateResolutionVisitor<'a, '_, 'ast> {
         path: &[Segment],
         ns: Namespace,
         filter_fn: &impl Fn(Res) -> bool,
-        span: Span,
     ) -> Option<TypoSuggestion> {
         let mut names = Vec::new();
         if path.len() == 1 {
@@ -1384,7 +1366,7 @@ impl<'a: 'ast, 'ast> LateResolutionVisitor<'a, '_, 'ast> {
             // Search in module.
             let mod_path = &path[..path.len() - 1];
             if let PathResult::Module(ModuleOrUniformRoot::Module(module)) =
-                self.resolve_path(mod_path, Some(TypeNS), false, span, CrateLint::No)
+                self.resolve_path(mod_path, Some(TypeNS), Finalize::No)
             {
                 self.r.add_module_candidates(module, &mut names, &filter_fn);
             }
@@ -1819,7 +1801,7 @@ impl<'tcx> LifetimeContext<'_, 'tcx> {
         &self,
         spans: Vec<Span>,
         count: usize,
-    ) -> DiagnosticBuilder<'tcx, ErrorReported> {
+    ) -> DiagnosticBuilder<'tcx, ErrorGuaranteed> {
         struct_span_err!(
             self.tcx.sess,
             spans,
@@ -1997,7 +1979,7 @@ impl<'tcx> LifetimeContext<'_, 'tcx> {
                     Vec::new(),
                     &[],
                 );
-                db.emit()
+                db.emit();
             },
         );
     }
@@ -2170,7 +2152,7 @@ impl<'tcx> LifetimeContext<'_, 'tcx> {
                             // but if we make a mistake elsewhere, mainly by keeping something in
                             // `missing_named_lifetime_spots` that we shouldn't, like associated
                             // `const`s or making a mistake in the AST lowering we would provide
-                            // non-sensical suggestions. Guard against that by skipping these.
+                            // nonsensical suggestions. Guard against that by skipping these.
                             // (#74264)
                             continue;
                         }

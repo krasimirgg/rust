@@ -15,13 +15,13 @@ use rustc_attr::{self as attr, SignedInt, UnsignedInt};
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_data_structures::intern::Interned;
 use rustc_data_structures::stable_hasher::{HashStable, StableHasher};
-use rustc_errors::ErrorReported;
+use rustc_errors::ErrorGuaranteed;
 use rustc_hir as hir;
 use rustc_hir::def::{CtorOf, DefKind, Res};
 use rustc_hir::def_id::DefId;
 use rustc_macros::HashStable;
 use rustc_query_system::ich::NodeIdHashingMode;
-use rustc_span::DUMMY_SP;
+use rustc_span::{sym, DUMMY_SP};
 use rustc_target::abi::{Integer, Size, TargetDataLayout};
 use smallvec::SmallVec;
 use std::{fmt, iter};
@@ -352,7 +352,7 @@ impl<'tcx> TyCtxt<'tcx> {
     pub fn calculate_dtor(
         self,
         adt_did: DefId,
-        validate: impl Fn(Self, DefId) -> Result<(), ErrorReported>,
+        validate: impl Fn(Self, DefId) -> Result<(), ErrorGuaranteed>,
     ) -> Option<ty::Destructor> {
         let drop_trait = self.lang_items().drop_trait()?;
         self.ensure().coherent_trait(drop_trait);
@@ -377,10 +377,10 @@ impl<'tcx> TyCtxt<'tcx> {
     /// Note that this returns only the constraints for the
     /// destructor of `def` itself. For the destructors of the
     /// contents, you need `adt_dtorck_constraint`.
-    pub fn destructor_constraints(self, def: &'tcx ty::AdtDef) -> Vec<ty::subst::GenericArg<'tcx>> {
+    pub fn destructor_constraints(self, def: ty::AdtDef<'tcx>) -> Vec<ty::subst::GenericArg<'tcx>> {
         let dtor = match def.destructor(self) {
             None => {
-                debug!("destructor_constraints({:?}) - no dtor", def.did);
+                debug!("destructor_constraints({:?}) - no dtor", def.did());
                 return vec![];
             }
             Some(dtor) => dtor.did,
@@ -415,7 +415,7 @@ impl<'tcx> TyCtxt<'tcx> {
             _ => bug!(),
         };
 
-        let item_substs = match *self.type_of(def.did).kind() {
+        let item_substs = match *self.type_of(def.did()).kind() {
             ty::Adt(def_, substs) if def_ == def => substs,
             _ => bug!(),
         };
@@ -445,7 +445,7 @@ impl<'tcx> TyCtxt<'tcx> {
             })
             .map(|(item_param, _)| item_param)
             .collect();
-        debug!("destructor_constraint({:?}) = {:?}", def.did, result);
+        debug!("destructor_constraint({:?}) = {:?}", def.did(), result);
         result
     }
 
@@ -486,7 +486,7 @@ impl<'tcx> TyCtxt<'tcx> {
     }
 
     /// Given the `DefId`, returns the `DefId` of the innermost item that
-    /// has its own type-checking context or "inference enviornment".
+    /// has its own type-checking context or "inference environment".
     ///
     /// For example, a closure has its own `DefId`, but it is type-checked
     /// with the containing item. Similarly, an inline const block has its
@@ -533,8 +533,14 @@ impl<'tcx> TyCtxt<'tcx> {
     }
 
     /// Returns `true` if the node pointed to by `def_id` is a `static` item.
+    #[inline]
     pub fn is_static(self, def_id: DefId) -> bool {
-        self.static_mutability(def_id).is_some()
+        matches!(self.def_kind(def_id), DefKind::Static(_))
+    }
+
+    #[inline]
+    pub fn static_mutability(self, def_id: DefId) -> Option<hir::Mutability> {
+        if let DefKind::Static(mt) = self.def_kind(def_id) { Some(mt) } else { None }
     }
 
     /// Returns `true` if this is a `static` item with the `#[thread_local]` attribute.
@@ -543,6 +549,7 @@ impl<'tcx> TyCtxt<'tcx> {
     }
 
     /// Returns `true` if the node pointed to by `def_id` is a mutable `static` item.
+    #[inline]
     pub fn is_mutable_static(self, def_id: DefId) -> bool {
         self.static_mutability(def_id) == Some(hir::Mutability::Mut)
     }
@@ -704,7 +711,7 @@ impl<'tcx> Ty<'tcx> {
         tcx_at: TyCtxtAt<'tcx>,
         param_env: ty::ParamEnv<'tcx>,
     ) -> bool {
-        tcx_at.is_copy_raw(param_env.and(self))
+        self.is_trivially_pure_clone_copy() || tcx_at.is_copy_raw(param_env.and(self))
     }
 
     /// Checks whether values of this type `T` have a size known at
@@ -1154,6 +1161,14 @@ pub fn normalize_opaque_types<'tcx>(
     val.fold_with(&mut visitor)
 }
 
+/// Determines whether an item is annotated with `doc(hidden)`.
+pub fn is_doc_hidden(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
+    tcx.get_attrs(def_id)
+        .iter()
+        .filter_map(|attr| if attr.has_name(sym::doc) { attr.meta_item_list() } else { None })
+        .any(|items| items.iter().any(|item| item.has_name(sym::hidden)))
+}
+
 pub fn provide(providers: &mut ty::query::Providers) {
-    *providers = ty::query::Providers { normalize_opaque_types, ..*providers }
+    *providers = ty::query::Providers { normalize_opaque_types, is_doc_hidden, ..*providers }
 }

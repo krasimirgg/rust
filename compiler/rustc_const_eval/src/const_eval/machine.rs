@@ -1,4 +1,3 @@
-use rustc_errors::ErrorReported;
 use rustc_hir::def::DefKind;
 use rustc_middle::mir;
 use rustc_middle::ty::{self, Ty};
@@ -18,8 +17,8 @@ use rustc_target::abi::{Align, Size};
 use rustc_target::spec::abi::Abi;
 
 use crate::interpret::{
-    self, compile_time_machine, AllocId, Allocation, Frame, ImmTy, InterpCx, InterpResult, OpTy,
-    PlaceTy, Scalar, StackPopUnwind,
+    self, compile_time_machine, AllocId, ConstAllocation, Frame, ImmTy, InterpCx, InterpResult,
+    OpTy, PlaceTy, Scalar, StackPopUnwind,
 };
 
 use super::error::*;
@@ -94,10 +93,7 @@ pub struct CompileTimeInterpreter<'mir, 'tcx> {
 
     /// The virtual call stack.
     pub(crate) stack: Vec<Frame<'mir, 'tcx, AllocId, ()>>,
-}
 
-#[derive(Copy, Clone, Debug)]
-pub struct MemoryExtra {
     /// We need to make sure consts never point to anything mutable, even recursively. That is
     /// relied on for pattern matching on consts with references.
     /// To achieve this, two pieces have to work together:
@@ -108,8 +104,12 @@ pub struct MemoryExtra {
 }
 
 impl<'mir, 'tcx> CompileTimeInterpreter<'mir, 'tcx> {
-    pub(super) fn new(const_eval_limit: Limit) -> Self {
-        CompileTimeInterpreter { steps_remaining: const_eval_limit.0, stack: Vec::new() }
+    pub(super) fn new(const_eval_limit: Limit, can_access_statics: bool) -> Self {
+        CompileTimeInterpreter {
+            steps_remaining: const_eval_limit.0,
+            stack: Vec::new(),
+            can_access_statics,
+        }
     }
 }
 
@@ -234,8 +234,6 @@ impl<'mir, 'tcx> interpret::Machine<'mir, 'tcx> for CompileTimeInterpreter<'mir,
 
     type MemoryKind = MemoryKind;
 
-    type MemoryExtra = MemoryExtra;
-
     const PANIC_ON_ALLOC_FAIL: bool = false; // will be raised as a proper error
 
     fn load_mir(
@@ -247,11 +245,11 @@ impl<'mir, 'tcx> interpret::Machine<'mir, 'tcx> for CompileTimeInterpreter<'mir,
                 if ecx.tcx.is_ctfe_mir_available(def.did) {
                     Ok(ecx.tcx.mir_for_ctfe_opt_const_arg(def))
                 } else if ecx.tcx.def_kind(def.did) == DefKind::AssocConst {
-                    ecx.tcx.sess.delay_span_bug(
+                    let guar = ecx.tcx.sess.delay_span_bug(
                         rustc_span::DUMMY_SP,
                         "This is likely a const item that is missing from its impl",
                     );
-                    throw_inval!(AlreadyReported(ErrorReported {}));
+                    throw_inval!(AlreadyReported(guar));
                 } else {
                     let path = ecx.tcx.def_path_str(def.did);
                     Err(ConstEvalErrKind::NeedsRfc(format!("calling extern function `{}`", path))
@@ -346,7 +344,7 @@ impl<'mir, 'tcx> interpret::Machine<'mir, 'tcx> for CompileTimeInterpreter<'mir,
                     Err(err) => throw_ub_format!("align has to be a power of 2, {}", err),
                 };
 
-                let ptr = ecx.memory.allocate(
+                let ptr = ecx.allocate_ptr(
                     Size::from_bytes(size as u64),
                     align,
                     interpret::MemoryKind::Machine(MemoryKind::Heap),
@@ -366,14 +364,14 @@ impl<'mir, 'tcx> interpret::Machine<'mir, 'tcx> for CompileTimeInterpreter<'mir,
 
                 // If an allocation is created in an another const,
                 // we don't deallocate it.
-                let (alloc_id, _, _) = ecx.memory.ptr_get_alloc(ptr)?;
+                let (alloc_id, _, _) = ecx.ptr_get_alloc_id(ptr)?;
                 let is_allocated_in_another_const = matches!(
                     ecx.tcx.get_global_alloc(alloc_id),
                     Some(interpret::GlobalAlloc::Memory(_))
                 );
 
                 if !is_allocated_in_another_const {
-                    ecx.memory.deallocate(
+                    ecx.deallocate_ptr(
                         ptr,
                         Some((size, align)),
                         interpret::MemoryKind::Machine(MemoryKind::Heap),
@@ -473,22 +471,23 @@ impl<'mir, 'tcx> interpret::Machine<'mir, 'tcx> for CompileTimeInterpreter<'mir,
     }
 
     fn before_access_global(
-        memory_extra: &MemoryExtra,
+        machine: &Self,
         alloc_id: AllocId,
-        allocation: &Allocation,
+        alloc: ConstAllocation<'tcx>,
         static_def_id: Option<DefId>,
         is_write: bool,
     ) -> InterpResult<'tcx> {
+        let alloc = alloc.inner();
         if is_write {
             // Write access. These are never allowed, but we give a targeted error message.
-            if allocation.mutability == Mutability::Not {
+            if alloc.mutability == Mutability::Not {
                 Err(err_ub!(WriteToReadOnly(alloc_id)).into())
             } else {
                 Err(ConstEvalErrKind::ModifiedGlobal.into())
             }
         } else {
             // Read access. These are usually allowed, with some exceptions.
-            if memory_extra.can_access_statics {
+            if machine.can_access_statics {
                 // Machine configuration allows us read from anything (e.g., `static` initializer).
                 Ok(())
             } else if static_def_id.is_some() {
@@ -504,7 +503,7 @@ impl<'mir, 'tcx> interpret::Machine<'mir, 'tcx> for CompileTimeInterpreter<'mir,
                 // But make sure we never accept a read from something mutable, that would be
                 // unsound. The reason is that as the content of this allocation may be different
                 // now and at run-time, so if we permit reading now we might return the wrong value.
-                assert_eq!(allocation.mutability, Mutability::Not);
+                assert_eq!(alloc.mutability, Mutability::Not);
                 Ok(())
             }
         }

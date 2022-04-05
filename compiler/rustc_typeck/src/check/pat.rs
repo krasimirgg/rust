@@ -3,7 +3,8 @@ use rustc_ast as ast;
 
 use rustc_data_structures::fx::FxHashMap;
 use rustc_errors::{
-    pluralize, struct_span_err, Applicability, Diagnostic, DiagnosticBuilder, ErrorReported,
+    pluralize, struct_span_err, Applicability, Diagnostic, DiagnosticBuilder, ErrorGuaranteed,
+    MultiSpan,
 };
 use rustc_hir as hir;
 use rustc_hir::def::{CtorKind, DefKind, Res};
@@ -11,13 +12,14 @@ use rustc_hir::pat_util::EnumerateAndAdjustIterator;
 use rustc_hir::{HirId, Pat, PatKind};
 use rustc_infer::infer;
 use rustc_infer::infer::type_variable::{TypeVariableOrigin, TypeVariableOriginKind};
+use rustc_middle::middle::stability::EvalResult;
 use rustc_middle::ty::{self, Adt, BindingMode, Ty, TypeFoldable};
 use rustc_session::lint::builtin::NON_EXHAUSTIVE_OMITTED_PATTERNS;
 use rustc_span::hygiene::DesugaringKind;
 use rustc_span::lev_distance::find_best_match_for_name;
 use rustc_span::source_map::{Span, Spanned};
-use rustc_span::symbol::{sym, Ident};
-use rustc_span::{BytePos, MultiSpan, DUMMY_SP};
+use rustc_span::symbol::{kw, sym, Ident};
+use rustc_span::{BytePos, DUMMY_SP};
 use rustc_trait_selection::autoderef::Autoderef;
 use rustc_trait_selection::traits::{ObligationCause, Pattern};
 use ty::VariantDef;
@@ -100,7 +102,7 @@ impl<'tcx> FnCtxt<'_, 'tcx> {
         expected: Ty<'tcx>,
         actual: Ty<'tcx>,
         ti: TopInfo<'tcx>,
-    ) -> Option<DiagnosticBuilder<'tcx, ErrorReported>> {
+    ) -> Option<DiagnosticBuilder<'tcx, ErrorGuaranteed>> {
         self.demand_eqtype_with_origin(&self.pattern_cause(ti, cause_span), expected, actual)
     }
 
@@ -307,7 +309,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 // In the `ValueNS`, we have `SelfCtor(..) | Ctor(_, Const), _)` remaining which
                 // could successfully compile. The former being `Self` requires a unit struct.
                 // In either case, and unlike constants, the pattern itself cannot be
-                // a reference type wherefore peeling doesn't give up any expressivity.
+                // a reference type wherefore peeling doesn't give up any expressiveness.
                 _ => AdjustMode::Peel,
             },
             // When encountering a `& mut? pat` pattern, reset to "by value".
@@ -459,7 +461,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 // The early check here is not for correctness, but rather better
                 // diagnostics (e.g. when `&str` is being matched, `expected` will
                 // be peeled to `str` while ty here is still `&str`, if we don't
-                // err ealy here, a rather confusing unification error will be
+                // err early here, a rather confusing unification error will be
                 // emitted instead).
                 let fail =
                     !(ty.is_numeric() || ty.is_char() || ty.is_ty_var() || ty.references_error());
@@ -818,7 +820,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
 
     fn emit_bad_pat_path<'b>(
         &self,
-        mut e: DiagnosticBuilder<'_, ErrorReported>,
+        mut e: DiagnosticBuilder<'_, ErrorGuaranteed>,
         pat_span: Span,
         res: Res,
         pat_res: Res,
@@ -850,7 +852,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     _ => {
                         let (type_def_id, item_def_id) = match pat_ty.kind() {
                             Adt(def, _) => match res {
-                                Res::Def(DefKind::Const, def_id) => (Some(def.did), Some(def_id)),
+                                Res::Def(DefKind::Const, def_id) => (Some(def.did()), Some(def_id)),
                                 _ => (None, None),
                             },
                             _ => (None, None),
@@ -1257,7 +1259,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                             self.field_ty(span, f, substs)
                         })
                         .unwrap_or_else(|| {
-                            inexistent_fields.push(field.ident);
+                            inexistent_fields.push(field);
                             no_field_errors = false;
                             tcx.ty_error()
                         })
@@ -1274,19 +1276,22 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             .filter(|(_, ident)| !used_fields.contains_key(ident))
             .collect::<Vec<_>>();
 
-        let inexistent_fields_err = if !(inexistent_fields.is_empty() || variant.is_recovered()) {
+        let inexistent_fields_err = if !(inexistent_fields.is_empty() || variant.is_recovered())
+            && !inexistent_fields.iter().any(|field| field.ident.name == kw::Underscore)
+        {
             Some(self.error_inexistent_fields(
                 adt.variant_descr(),
                 &inexistent_fields,
                 &mut unmentioned_fields,
                 variant,
+                substs,
             ))
         } else {
             None
         };
 
         // Require `..` if struct has non_exhaustive attribute.
-        let non_exhaustive = variant.is_field_list_non_exhaustive() && !adt.did.is_local();
+        let non_exhaustive = variant.is_field_list_non_exhaustive() && !adt.did().is_local();
         if non_exhaustive && !has_rest_pat {
             self.error_foreign_non_exhaustive_spat(pat, adt.variant_descr(), fields.is_empty());
         }
@@ -1308,6 +1313,12 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 .copied()
                 .filter(|(field, _)| {
                     field.vis.is_accessible_from(tcx.parent_module(pat.hir_id).to_def_id(), tcx)
+                        && !matches!(
+                            tcx.eval_stability(field.did, None, DUMMY_SP, None),
+                            EvalResult::Deny { .. }
+                        )
+                        // We only want to report the error if it is hidden and not local
+                        && !(tcx.is_doc_hidden(field.did) && !field.did.is_local())
                 })
                 .collect();
 
@@ -1333,7 +1344,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         match (inexistent_fields_err, unmentioned_err) {
             (Some(mut i), Some(mut u)) => {
                 if let Some(mut e) = self.error_tuple_variant_as_struct_pat(pat, fields, variant) {
-                    // We don't want to show the inexistent fields error when this was
+                    // We don't want to show the nonexistent fields error when this was
                     // `Foo { a, b }` when it should have been `Foo(a, b)`.
                     i.delay_as_bug();
                     u.delay_as_bug();
@@ -1369,7 +1380,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         variant: &VariantDef,
         pat: &'_ Pat<'_>,
         fields: &[hir::PatField<'_>],
-    ) -> Option<DiagnosticBuilder<'_, ErrorReported>> {
+    ) -> Option<DiagnosticBuilder<'_, ErrorGuaranteed>> {
         // if this is a tuple struct, then all field names will be numbers
         // so if any fields in a struct pattern use shorthand syntax, they will
         // be invalid identifiers (for example, Foo { 0, 1 }).
@@ -1439,20 +1450,21 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     fn error_inexistent_fields(
         &self,
         kind_name: &str,
-        inexistent_fields: &[Ident],
-        unmentioned_fields: &mut Vec<(&ty::FieldDef, Ident)>,
+        inexistent_fields: &[&hir::PatField<'tcx>],
+        unmentioned_fields: &mut Vec<(&'tcx ty::FieldDef, Ident)>,
         variant: &ty::VariantDef,
-    ) -> DiagnosticBuilder<'tcx, ErrorReported> {
+        substs: &'tcx ty::List<ty::subst::GenericArg<'tcx>>,
+    ) -> DiagnosticBuilder<'tcx, ErrorGuaranteed> {
         let tcx = self.tcx;
         let (field_names, t, plural) = if inexistent_fields.len() == 1 {
-            (format!("a field named `{}`", inexistent_fields[0]), "this", "")
+            (format!("a field named `{}`", inexistent_fields[0].ident), "this", "")
         } else {
             (
                 format!(
                     "fields named {}",
                     inexistent_fields
                         .iter()
-                        .map(|ident| format!("`{}`", ident))
+                        .map(|field| format!("`{}`", field.ident))
                         .collect::<Vec<String>>()
                         .join(", ")
                 ),
@@ -1460,7 +1472,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 "s",
             )
         };
-        let spans = inexistent_fields.iter().map(|ident| ident.span).collect::<Vec<_>>();
+        let spans = inexistent_fields.iter().map(|field| field.ident.span).collect::<Vec<_>>();
         let mut err = struct_span_err!(
             tcx.sess,
             spans,
@@ -1470,9 +1482,9 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             tcx.def_path_str(variant.def_id),
             field_names
         );
-        if let Some(ident) = inexistent_fields.last() {
+        if let Some(pat_field) = inexistent_fields.last() {
             err.span_label(
-                ident.span,
+                pat_field.ident.span,
                 format!(
                     "{} `{}` does not have {} field{}",
                     kind_name,
@@ -1485,10 +1497,10 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             if unmentioned_fields.len() == 1 {
                 let input =
                     unmentioned_fields.iter().map(|(_, field)| field.name).collect::<Vec<_>>();
-                let suggested_name = find_best_match_for_name(&input, ident.name, None);
+                let suggested_name = find_best_match_for_name(&input, pat_field.ident.name, None);
                 if let Some(suggested_name) = suggested_name {
                     err.span_suggestion(
-                        ident.span,
+                        pat_field.ident.span,
                         "a field with a similar name exists",
                         suggested_name.to_string(),
                         Applicability::MaybeIncorrect,
@@ -1504,17 +1516,30 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         unmentioned_fields.retain(|&(_, x)| x.name != suggested_name);
                     }
                 } else if inexistent_fields.len() == 1 {
-                    let unmentioned_field = unmentioned_fields[0].1.name;
-                    err.span_suggestion_short(
-                        ident.span,
-                        &format!(
-                            "`{}` has a field named `{}`",
-                            tcx.def_path_str(variant.def_id),
-                            unmentioned_field
-                        ),
-                        unmentioned_field.to_string(),
-                        Applicability::MaybeIncorrect,
-                    );
+                    match pat_field.pat.kind {
+                        PatKind::Lit(expr)
+                            if !self.can_coerce(
+                                self.typeck_results.borrow().expr_ty(expr),
+                                self.field_ty(
+                                    unmentioned_fields[0].1.span,
+                                    unmentioned_fields[0].0,
+                                    substs,
+                                ),
+                            ) => {}
+                        _ => {
+                            let unmentioned_field = unmentioned_fields[0].1.name;
+                            err.span_suggestion_short(
+                                pat_field.ident.span,
+                                &format!(
+                                    "`{}` has a field named `{}`",
+                                    tcx.def_path_str(variant.def_id),
+                                    unmentioned_field
+                                ),
+                                unmentioned_field.to_string(),
+                                Applicability::MaybeIncorrect,
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -1538,7 +1563,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         pat: &Pat<'_>,
         fields: &'tcx [hir::PatField<'tcx>],
         variant: &ty::VariantDef,
-    ) -> Option<DiagnosticBuilder<'tcx, ErrorReported>> {
+    ) -> Option<DiagnosticBuilder<'tcx, ErrorGuaranteed>> {
         if let (CtorKind::Fn, PatKind::Struct(qpath, ..)) = (variant.ctor_kind, &pat.kind) {
             let path = rustc_hir_pretty::to_string(rustc_hir_pretty::NO_ANN, |s| {
                 s.print_qpath(qpath, false)
@@ -1620,7 +1645,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         &self,
         pat: &Pat<'_>,
         fields: &'tcx [hir::PatField<'tcx>],
-    ) -> DiagnosticBuilder<'tcx, ErrorReported> {
+    ) -> DiagnosticBuilder<'tcx, ErrorGuaranteed> {
         let mut err = self
             .tcx
             .sess
@@ -1712,7 +1737,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         unmentioned_fields: &[(&ty::FieldDef, Ident)],
         have_inaccessible_fields: bool,
         fields: &'tcx [hir::PatField<'tcx>],
-    ) -> DiagnosticBuilder<'tcx, ErrorReported> {
+    ) -> DiagnosticBuilder<'tcx, ErrorGuaranteed> {
         let inaccessible = if have_inaccessible_fields { " and inaccessible fields" } else { "" };
         let field_names = if unmentioned_fields.len() == 1 {
             format!("field `{}`{}", unmentioned_fields[0].1, inaccessible)
@@ -1754,7 +1779,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             sp,
             &format!(
                 "include the missing field{} in the pattern{}",
-                if len == 1 { "" } else { "s" },
+                pluralize!(len),
                 if have_inaccessible_fields { " and ignore the inaccessible fields" } else { "" }
             ),
             format!(
@@ -1773,10 +1798,10 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         err.span_suggestion(
             sp,
             &format!(
-                "if you don't care about {} missing field{}, you can explicitly ignore {}",
-                if len == 1 { "this" } else { "these" },
-                if len == 1 { "" } else { "s" },
-                if len == 1 { "it" } else { "them" },
+                "if you don't care about {these} missing field{s}, you can explicitly ignore {them}",
+                these = pluralize!("this", len),
+                s = pluralize!(len),
+                them = if len == 1 { "it" } else { "them" },
             ),
             format!("{}..{}", prefix, postfix),
             Applicability::MachineApplicable,
@@ -2042,8 +2067,8 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     .find_map(|(ty, _)| {
                         match ty.kind() {
                             ty::Adt(adt_def, _)
-                                if self.tcx.is_diagnostic_item(sym::Option, adt_def.did)
-                                    || self.tcx.is_diagnostic_item(sym::Result, adt_def.did) =>
+                                if self.tcx.is_diagnostic_item(sym::Option, adt_def.did())
+                                    || self.tcx.is_diagnostic_item(sym::Result, adt_def.did()) =>
                             {
                                 // Slicing won't work here, but `.as_deref()` might (issue #91328).
                                 err.span_suggestion(

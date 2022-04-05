@@ -192,7 +192,7 @@ fn find_capture_matching_projections<'a, 'tcx>(
         is_ancestor_or_same_capture(&possible_ancestor_proj_kinds, &hir_projections)
     })?;
 
-    // Convert index to be from the presepective of the entire closure_min_captures map
+    // Convert index to be from the perspective of the entire closure_min_captures map
     // instead of just the root variable capture list
     Some((compute_capture_idx(closure_min_captures, var_hir_id, idx), capture))
 }
@@ -334,8 +334,8 @@ impl<'tcx> PlaceBuilder<'tcx> {
         self.project(PlaceElem::Deref)
     }
 
-    crate fn downcast(self, adt_def: &'tcx AdtDef, variant_index: VariantIdx) -> Self {
-        self.project(PlaceElem::Downcast(Some(adt_def.variants[variant_index].name), variant_index))
+    crate fn downcast(self, adt_def: AdtDef<'tcx>, variant_index: VariantIdx) -> Self {
+        self.project(PlaceElem::Downcast(Some(adt_def.variant(variant_index).name), variant_index))
     }
 
     fn index(self, index: Local) -> Self {
@@ -566,6 +566,9 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             | ExprKind::Continue { .. }
             | ExprKind::Return { .. }
             | ExprKind::Literal { .. }
+            | ExprKind::NamedConst { .. }
+            | ExprKind::NonHirLiteral { .. }
+            | ExprKind::ConstParam { .. }
             | ExprKind::ConstBlock { .. }
             | ExprKind::StaticRef { .. }
             | ExprKind::InlineAsm { .. }

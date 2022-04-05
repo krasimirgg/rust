@@ -4,7 +4,7 @@ use crate::constrained_generic_params::{identify_constrained_generic_params, Par
 
 use rustc_ast as ast;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
-use rustc_errors::{struct_span_err, Applicability, DiagnosticBuilder, ErrorReported};
+use rustc_errors::{struct_span_err, Applicability, DiagnosticBuilder, ErrorGuaranteed};
 use rustc_hir as hir;
 use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_hir::intravisit as hir_visit;
@@ -510,7 +510,7 @@ fn gather_gat_bounds<'tcx, T: TypeFoldable<'tcx>>(
 
     for (region_a, region_a_idx) in &regions {
         // Ignore `'static` lifetimes for the purpose of this lint: it's
-        // because we know it outlives everything and so doesn't give meaninful
+        // because we know it outlives everything and so doesn't give meaningful
         // clues
         if let ty::ReStatic = **region_a {
             continue;
@@ -677,9 +677,9 @@ fn resolve_regions_with_wf_tys<'tcx>(
 struct GATSubstCollector<'tcx> {
     tcx: TyCtxt<'tcx>,
     gat: DefId,
-    // Which region appears and which parameter index its subsituted for
+    // Which region appears and which parameter index its substituted for
     regions: FxHashSet<(ty::Region<'tcx>, usize)>,
-    // Which params appears and which parameter index its subsituted for
+    // Which params appears and which parameter index its substituted for
     types: FxHashSet<(Ty<'tcx>, usize)>,
 }
 
@@ -940,7 +940,7 @@ fn check_associated_item(
                     item.ident(fcx.tcx).span,
                     sig,
                     hir_sig.decl,
-                    item.def_id,
+                    item.def_id.expect_local(),
                     &mut implied_bounds,
                 );
                 check_method_receiver(fcx, hir_sig, item, self_ty);
@@ -995,7 +995,7 @@ fn check_type_defn<'tcx, F>(
 {
     for_item(tcx, item).with_fcx(|fcx| {
         let variants = lookup_fields(fcx);
-        let packed = tcx.adt_def(item.def_id).repr.packed();
+        let packed = tcx.adt_def(item.def_id).repr().packed();
 
         for variant in &variants {
             // For DST, or when drop needs to copy things around, all
@@ -1068,7 +1068,7 @@ fn check_type_defn<'tcx, F>(
             }
         }
 
-        check_where_clauses(fcx, item.span, item.def_id.to_def_id(), None);
+        check_where_clauses(fcx, item.span, item.def_id, None);
 
         // No implied bounds in a struct definition.
         FxHashSet::default()
@@ -1096,7 +1096,7 @@ fn check_trait(tcx: TyCtxt<'_>, item: &hir::Item<'_>) {
 
     // FIXME: this shouldn't use an `FnCtxt` at all.
     for_item(tcx, item).with_fcx(|fcx| {
-        check_where_clauses(fcx, item.span, item.def_id.to_def_id(), None);
+        check_where_clauses(fcx, item.span, item.def_id, None);
 
         FxHashSet::default()
     });
@@ -1144,7 +1144,7 @@ fn check_item_fn(
     for_id(tcx, def_id, span).with_fcx(|fcx| {
         let sig = tcx.fn_sig(def_id);
         let mut implied_bounds = FxHashSet::default();
-        check_fn_or_method(fcx, ident.span, sig, decl, def_id.to_def_id(), &mut implied_bounds);
+        check_fn_or_method(fcx, ident.span, sig, decl, def_id, &mut implied_bounds);
         implied_bounds
     })
 }
@@ -1238,7 +1238,7 @@ fn check_impl<'tcx>(
             }
         }
 
-        check_where_clauses(fcx, item.span, item.def_id.to_def_id(), None);
+        check_where_clauses(fcx, item.span, item.def_id, None);
 
         fcx.impl_implied_bounds(item.def_id.to_def_id(), item.span)
     });
@@ -1249,7 +1249,7 @@ fn check_impl<'tcx>(
 fn check_where_clauses<'tcx, 'fcx>(
     fcx: &FnCtxt<'fcx, 'tcx>,
     span: Span,
-    def_id: DefId,
+    def_id: LocalDefId,
     return_ty: Option<(Ty<'tcx>, Span)>,
 ) {
     let tcx = fcx.tcx;
@@ -1317,7 +1317,7 @@ fn check_where_clauses<'tcx, 'fcx>(
     // For more examples see tests `defaults-well-formedness.rs` and `type-check-defaults.rs`.
     //
     // First we build the defaulted substitution.
-    let substs = InternalSubsts::for_item(tcx, def_id, |param, _| {
+    let substs = InternalSubsts::for_item(tcx, def_id.to_def_id(), |param, _| {
         match param.kind {
             GenericParamDefKind::Lifetime => {
                 // All regions are identity.
@@ -1411,8 +1411,11 @@ fn check_where_clauses<'tcx, 'fcx>(
             // below: there, we are not trying to prove those predicates
             // to be *true* but merely *well-formed*.
             let pred = fcx.normalize_associated_types_in(sp, pred);
-            let cause =
-                traits::ObligationCause::new(sp, fcx.body_id, traits::ItemObligation(def_id));
+            let cause = traits::ObligationCause::new(
+                sp,
+                fcx.body_id,
+                traits::ItemObligation(def_id.to_def_id()),
+            );
             traits::Obligation::new(cause, fcx.param_env, pred)
         });
 
@@ -1445,10 +1448,10 @@ fn check_fn_or_method<'fcx, 'tcx>(
     span: Span,
     sig: ty::PolyFnSig<'tcx>,
     hir_decl: &hir::FnDecl<'_>,
-    def_id: DefId,
+    def_id: LocalDefId,
     implied_bounds: &mut FxHashSet<Ty<'tcx>>,
 ) {
-    let sig = fcx.tcx.liberate_late_bound_regions(def_id, sig);
+    let sig = fcx.tcx.liberate_late_bound_regions(def_id.to_def_id(), sig);
 
     // Normalize the input and output types one at a time, using a different
     // `WellFormedLoc` for each. We cannot call `normalize_associated_types`
@@ -1462,14 +1465,14 @@ fn check_fn_or_method<'fcx, 'tcx>(
                 span,
                 ty,
                 WellFormedLoc::Param {
-                    function: def_id.expect_local(),
+                    function: def_id,
                     // Note that the `param_idx` of the output type is
                     // one greater than the index of the last input type.
                     param_idx: i.try_into().unwrap(),
                 },
             )
         }));
-    // Manually call `normalize_assocaited_types_in` on the other types
+    // Manually call `normalize_associated_types_in` on the other types
     // in `FnSig`. This ensures that if the types of these fields
     // ever change to include projections, we will start normalizing
     // them automatically.
@@ -1485,7 +1488,7 @@ fn check_fn_or_method<'fcx, 'tcx>(
             input_ty.into(),
             ty.span,
             ObligationCauseCode::WellFormed(Some(WellFormedLoc::Param {
-                function: def_id.expect_local(),
+                function: def_id,
                 param_idx: i.try_into().unwrap(),
             })),
         );
@@ -1764,7 +1767,7 @@ fn report_bivariance(
     tcx: TyCtxt<'_>,
     param: &rustc_hir::GenericParam<'_>,
     has_explicit_bounds: bool,
-) -> ErrorReported {
+) -> ErrorGuaranteed {
     let span = param.span;
     let param_name = param.name.ident().name;
     let mut err = error_392(tcx, span, param_name);
@@ -1977,7 +1980,7 @@ fn error_392(
     tcx: TyCtxt<'_>,
     span: Span,
     param_name: Symbol,
-) -> DiagnosticBuilder<'_, ErrorReported> {
+) -> DiagnosticBuilder<'_, ErrorGuaranteed> {
     let mut err =
         struct_span_err!(tcx.sess, span, E0392, "parameter `{}` is never used", param_name);
     err.span_label(span, "unused parameter");

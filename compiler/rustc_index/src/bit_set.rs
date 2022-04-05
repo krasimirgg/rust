@@ -654,15 +654,19 @@ impl<T: Idx> BitRelations<ChunkedBitSet<T>> for ChunkedBitSet<T> {
 
 impl<T: Idx> BitRelations<HybridBitSet<T>> for ChunkedBitSet<T> {
     fn union(&mut self, other: &HybridBitSet<T>) -> bool {
-        // FIXME: this is slow if `other` is dense, and could easily be
-        // improved, but it hasn't been a problem in practice so far.
+        // FIXME: This is slow if `other` is dense, but it hasn't been a problem
+        // in practice so far.
+        // If a faster implementation of this operation is required, consider
+        // reopening https://github.com/rust-lang/rust/pull/94625
         assert_eq!(self.domain_size, other.domain_size());
         sequential_update(|elem| self.insert(elem), other.iter())
     }
 
     fn subtract(&mut self, other: &HybridBitSet<T>) -> bool {
-        // FIXME: this is slow if `other` is dense, and could easily be
-        // improved, but it hasn't been a problem in practice so far.
+        // FIXME: This is slow if `other` is dense, but it hasn't been a problem
+        // in practice so far.
+        // If a faster implementation of this operation is required, consider
+        // reopening https://github.com/rust-lang/rust/pull/94625
         assert_eq!(self.domain_size, other.domain_size());
         sequential_update(|elem| self.remove(elem), other.iter())
     }
@@ -1713,7 +1717,7 @@ impl<R: Idx, C: Idx> SparseBitMatrix<R, C> {
         if let Some(Some(row)) = self.rows.get(row) { Some(row) } else { None }
     }
 
-    /// Interescts `row` with `set`. `set` can be either `BitSet` or
+    /// Intersects `row` with `set`. `set` can be either `BitSet` or
     /// `HybridBitSet`. Has no effect if `row` does not exist.
     ///
     /// Returns true if the row was changed.

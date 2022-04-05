@@ -9,6 +9,7 @@
 #include "llvm/Object/Archive.h"
 #include "llvm/Object/COFFImportFile.h"
 #include "llvm/Object/ObjectFile.h"
+#include "llvm/Pass.h"
 #include "llvm/Bitcode/BitcodeWriterPass.h"
 #include "llvm/Support/Signals.h"
 #include "llvm/ADT/Optional.h"
@@ -265,12 +266,6 @@ extern "C" void LLVMRustAddCallSiteAttributes(LLVMValueRef Instr, unsigned Index
 extern "C" LLVMAttributeRef LLVMRustCreateAttrNoValue(LLVMContextRef C,
                                                       LLVMRustAttribute RustAttr) {
   return wrap(Attribute::get(*unwrap(C), fromRust(RustAttr)));
-}
-
-extern "C" LLVMAttributeRef LLVMRustCreateAttrStringValue(LLVMContextRef C,
-                                                          const char *Name,
-                                                          const char *Value) {
-  return wrap(Attribute::get(*unwrap(C), StringRef(Name), StringRef(Value)));
 }
 
 extern "C" LLVMAttributeRef LLVMRustCreateAlignmentAttr(LLVMContextRef C,

@@ -80,8 +80,7 @@ impl<'tcx> hir::itemlikevisit::ItemLikeVisitor<'tcx> for CheckConstTraitVisitor<
     /// of the trait being implemented; as those provided functions can be non-const.
     fn visit_item<'hir>(&mut self, item: &'hir hir::Item<'hir>) {
         let _: Option<_> = try {
-            if let hir::ItemKind::Impl(ref imp) = item.kind {
-                if let hir::Constness::Const = imp.constness {
+            if let hir::ItemKind::Impl(ref imp) = item.kind && let hir::Constness::Const = imp.constness {
                     let trait_def_id = imp.of_trait.as_ref()?.trait_def_id()?;
                     let ancestors = self
                         .tcx
@@ -100,7 +99,7 @@ impl<'tcx> hir::itemlikevisit::ItemLikeVisitor<'tcx> for CheckConstTraitVisitor<
                         } = *trait_item
                         {
                             // we can ignore functions that do not have default bodies:
-                            // if those are unimplemented it will be catched by typeck.
+                            // if those are unimplemented it will be caught by typeck.
                             if !defaultness.has_value()
                                 || self
                                     .tcx
@@ -132,7 +131,6 @@ impl<'tcx> hir::itemlikevisit::ItemLikeVisitor<'tcx> for CheckConstTraitVisitor<
                             .note(&format!("`{}` not implemented", to_implement.join("`, `")))
                             .emit();
                     }
-                }
             }
         };
     }

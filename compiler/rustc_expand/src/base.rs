@@ -10,7 +10,7 @@ use rustc_ast::{self as ast, AstLike, Attribute, Item, NodeId, PatKind};
 use rustc_attr::{self as attr, Deprecation, Stability};
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_data_structures::sync::{self, Lrc};
-use rustc_errors::{Applicability, DiagnosticBuilder, ErrorReported, PResult};
+use rustc_errors::{Applicability, DiagnosticBuilder, ErrorGuaranteed, MultiSpan};
 use rustc_lint_defs::builtin::PROC_MACRO_BACK_COMPAT;
 use rustc_lint_defs::BuiltinLintDiagnostics;
 use rustc_parse::{self, nt_to_tokenstream, parser, MACRO_ARGUMENTS};
@@ -20,7 +20,7 @@ use rustc_span::edition::Edition;
 use rustc_span::hygiene::{AstPass, ExpnData, ExpnKind, LocalExpnId};
 use rustc_span::source_map::SourceMap;
 use rustc_span::symbol::{kw, sym, Ident, Symbol};
-use rustc_span::{FileName, MultiSpan, Span, DUMMY_SP};
+use rustc_span::{Span, DUMMY_SP};
 use smallvec::{smallvec, SmallVec};
 
 use std::default::Default;
@@ -67,7 +67,7 @@ impl Annotatable {
             Annotatable::Param(ref p) => p.span,
             Annotatable::FieldDef(ref sf) => sf.span,
             Annotatable::Variant(ref v) => v.span,
-            Annotatable::Crate(ref c) => c.span,
+            Annotatable::Crate(ref c) => c.spans.inner_span,
         }
     }
 
@@ -275,7 +275,7 @@ pub trait ProcMacro {
         ecx: &'cx mut ExtCtxt<'_>,
         span: Span,
         ts: TokenStream,
-    ) -> Result<TokenStream, ErrorReported>;
+    ) -> Result<TokenStream, ErrorGuaranteed>;
 }
 
 impl<F> ProcMacro for F
@@ -287,7 +287,7 @@ where
         _ecx: &'cx mut ExtCtxt<'_>,
         _span: Span,
         ts: TokenStream,
-    ) -> Result<TokenStream, ErrorReported> {
+    ) -> Result<TokenStream, ErrorGuaranteed> {
         // FIXME setup implicit context in TLS before calling self.
         Ok(self(ts))
     }
@@ -300,7 +300,7 @@ pub trait AttrProcMacro {
         span: Span,
         annotation: TokenStream,
         annotated: TokenStream,
-    ) -> Result<TokenStream, ErrorReported>;
+    ) -> Result<TokenStream, ErrorGuaranteed>;
 }
 
 impl<F> AttrProcMacro for F
@@ -313,7 +313,7 @@ where
         _span: Span,
         annotation: TokenStream,
         annotated: TokenStream,
-    ) -> Result<TokenStream, ErrorReported> {
+    ) -> Result<TokenStream, ErrorGuaranteed> {
         // FIXME setup implicit context in TLS before calling self.
         Ok(self(annotation, annotated))
     }
@@ -1076,7 +1076,7 @@ impl<'a> ExtCtxt<'a> {
         &self,
         sp: S,
         msg: &str,
-    ) -> DiagnosticBuilder<'a, ErrorReported> {
+    ) -> DiagnosticBuilder<'a, ErrorGuaranteed> {
         self.sess.parse_sess.span_diagnostic.struct_span_err(sp, msg)
     }
 
@@ -1128,41 +1128,6 @@ impl<'a> ExtCtxt<'a> {
     pub fn check_unused_macros(&mut self) {
         self.resolver.check_unused_macros();
     }
-
-    /// Resolves a `path` mentioned inside Rust code, returning an absolute path.
-    ///
-    /// This unifies the logic used for resolving `include_X!`.
-    ///
-    /// FIXME: move this to `rustc_builtin_macros` and make it private.
-    pub fn resolve_path(&self, path: impl Into<PathBuf>, span: Span) -> PResult<'a, PathBuf> {
-        let path = path.into();
-
-        // Relative paths are resolved relative to the file in which they are found
-        // after macro expansion (that is, they are unhygienic).
-        if !path.is_absolute() {
-            let callsite = span.source_callsite();
-            let mut result = match self.source_map().span_to_filename(callsite) {
-                FileName::Real(name) => name
-                    .into_local_path()
-                    .expect("attempting to resolve a file path in an external file"),
-                FileName::DocTest(path, _) => path,
-                other => {
-                    return Err(self.struct_span_err(
-                        span,
-                        &format!(
-                            "cannot resolve relative path in non-file source `{}`",
-                            self.source_map().filename_for_diagnostics(&other)
-                        ),
-                    ));
-                }
-            };
-            result.pop();
-            result.push(path);
-            Ok(result)
-        } else {
-            Ok(path)
-        }
-    }
 }
 
 /// Extracts a string literal from the macro expanded version of `expr`,
@@ -1174,7 +1139,7 @@ pub fn expr_to_spanned_string<'a>(
     cx: &'a mut ExtCtxt<'_>,
     expr: P<ast::Expr>,
     err_msg: &str,
-) -> Result<(Symbol, ast::StrStyle, Span), Option<(DiagnosticBuilder<'a, ErrorReported>, bool)>> {
+) -> Result<(Symbol, ast::StrStyle, Span), Option<(DiagnosticBuilder<'a, ErrorGuaranteed>, bool)>> {
     // Perform eager expansion on the expression.
     // We want to be able to handle e.g., `concat!("foo", "bar")`.
     let expr = cx.expander().fully_expand_fragment(AstFragment::Expr(expr)).make_expr();
@@ -1330,7 +1295,7 @@ pub fn parse_macro_name_and_helper_attrs(
     let attributes_attr = list.get(1);
     let proc_attrs: Vec<_> = if let Some(attr) = attributes_attr {
         if !attr.has_name(sym::attributes) {
-            diag.span_err(attr.span(), "second argument must be `attributes`")
+            diag.span_err(attr.span(), "second argument must be `attributes`");
         }
         attr.meta_item_list()
             .unwrap_or_else(|| {

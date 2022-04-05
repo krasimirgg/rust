@@ -76,6 +76,12 @@ pub struct NativeLib {
     pub link_arg: Option<String>,
 }
 
+impl NativeLib {
+    pub fn has_modifiers(&self) -> bool {
+        self.verbatim.is_some() || self.kind.has_modifiers()
+    }
+}
+
 #[derive(Clone, Debug, Encodable, Decodable, HashStable_Generic)]
 pub struct DllImport {
     pub name: Symbol,

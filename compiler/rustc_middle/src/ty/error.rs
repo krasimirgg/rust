@@ -3,11 +3,11 @@ use crate::ty::diagnostics::suggest_constraining_type_param;
 use crate::ty::print::{FmtPrinter, Printer};
 use crate::ty::{self, BoundRegionKind, Region, Ty, TyCtxt};
 use rustc_errors::Applicability::{MachineApplicable, MaybeIncorrect};
-use rustc_errors::{pluralize, Diagnostic};
+use rustc_errors::{pluralize, Diagnostic, MultiSpan};
 use rustc_hir as hir;
 use rustc_hir::def_id::DefId;
 use rustc_span::symbol::{sym, Symbol};
-use rustc_span::{BytePos, MultiSpan, Span};
+use rustc_span::{BytePos, Span};
 use rustc_target::spec::abi;
 
 use std::borrow::Cow;
@@ -247,7 +247,7 @@ impl<'tcx> Ty<'tcx> {
             }
             ty::Tuple(ref tys) if tys.is_empty() => format!("`{}`", self).into(),
 
-            ty::Adt(def, _) => format!("{} `{}`", def.descr(), tcx.def_path_str(def.did)).into(),
+            ty::Adt(def, _) => format!("{} `{}`", def.descr(), tcx.def_path_str(def.did())).into(),
             ty::Foreign(def_id) => format!("extern type `{}`", tcx.def_path_str(def_id)).into(),
             ty::Array(t, n) => {
                 if t.is_simple_ty() {
@@ -847,7 +847,7 @@ fn foo(&self) -> Self::T { String::new() }
                 "{some} method{s} {are} available that return{r} `{ty}`",
                 some = if methods.len() == 1 { "a" } else { "some" },
                 s = pluralize!(methods.len()),
-                are = if methods.len() == 1 { "is" } else { "are" },
+                are = pluralize!("is", methods.len()),
                 r = if methods.len() == 1 { "s" } else { "" },
                 ty = expected
             );

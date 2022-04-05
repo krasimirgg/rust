@@ -5,7 +5,7 @@
 //! - [`rustc_middle::ty::Ty`], used to represent the semantics of a type.
 //! - [`rustc_middle::ty::TyCtxt`], the central data structure in the compiler.
 //!
-//! For more information, see ["The `ty` module: representing types"] in the ructc-dev-guide.
+//! For more information, see ["The `ty` module: representing types"] in the rustc-dev-guide.
 //!
 //! ["The `ty` module: representing types"]: https://rustc-dev-guide.rust-lang.org/ty.html
 
@@ -25,6 +25,7 @@ use crate::middle::privacy::AccessLevels;
 use crate::mir::{Body, GeneratorLayout};
 use crate::traits::{self, Reveal};
 use crate::ty;
+use crate::ty::fast_reject::SimplifiedType;
 use crate::ty::subst::{GenericArg, InternalSubsts, Subst, SubstsRef};
 use crate::ty::util::Discr;
 use rustc_ast as ast;
@@ -40,10 +41,11 @@ use rustc_hir::Node;
 use rustc_macros::HashStable;
 use rustc_query_system::ich::StableHashingContext;
 use rustc_session::cstore::CrateStoreDyn;
-use rustc_span::symbol::{kw, Ident, Symbol};
-use rustc_span::{sym, Span};
+use rustc_span::symbol::{kw, sym, Ident, Symbol};
+use rustc_span::Span;
 use rustc_target::abi::Align;
 
+use std::fmt::Debug;
 use std::hash::Hash;
 use std::ops::ControlFlow;
 use std::{fmt, str};
@@ -172,6 +174,12 @@ pub struct ImplHeader<'tcx> {
     pub predicates: Vec<Predicate<'tcx>>,
 }
 
+#[derive(Copy, Clone, Debug, TypeFoldable)]
+pub enum ImplSubject<'tcx> {
+    Trait(TraitRef<'tcx>),
+    Inherent(Ty<'tcx>),
+}
+
 #[derive(
     Copy,
     Clone,
@@ -280,6 +288,11 @@ pub struct ClosureSizeProfileData<'tcx> {
 
 pub trait DefIdTree: Copy {
     fn parent(self, id: DefId) -> Option<DefId>;
+
+    #[inline]
+    fn local_parent(self, id: LocalDefId) -> Option<LocalDefId> {
+        Some(self.parent(id.to_def_id())?.expect_local())
+    }
 
     fn is_descendant_of(self, mut descendant: DefId, ancestor: DefId) -> bool {
         if descendant.krate != ancestor.krate {
@@ -748,6 +761,13 @@ pub struct TraitPredicate<'tcx> {
 
     pub constness: BoundConstness,
 
+    /// If polarity is Positive: we are proving that the trait is implemented.
+    ///
+    /// If polarity is Negative: we are proving that a negative impl of this trait
+    /// exists. (Note that coherence also checks whether negative impls of supertraits
+    /// exist via a series of predicates.)
+    ///
+    /// If polarity is Reserved: that's a bug.
     pub polarity: ImplPolarity,
 }
 
@@ -758,6 +778,7 @@ impl<'tcx> TraitPredicate<'tcx> {
         if unlikely!(Some(self.trait_ref.def_id) == tcx.lang_items().drop_trait()) {
             // remap without changing constness of this predicate.
             // this is because `T: ~const Drop` has a different meaning to `T: Drop`
+            // FIXME(fee1-dead): remove this logic after beta bump
             param_env.remap_constness_with(self.constness)
         } else {
             *param_env = param_env.with_constness(self.constness.and(param_env.constness()))
@@ -1042,10 +1063,53 @@ impl<'tcx> InstantiatedPredicates<'tcx> {
     }
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, HashStable, TyEncodable, TyDecodable, TypeFoldable)]
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    PartialEq,
+    Eq,
+    HashStable,
+    TyEncodable,
+    TyDecodable,
+    TypeFoldable,
+    Lift
+)]
 pub struct OpaqueTypeKey<'tcx> {
     pub def_id: DefId,
     pub substs: SubstsRef<'tcx>,
+}
+
+#[derive(Copy, Clone, Debug, TypeFoldable, HashStable, TyEncodable, TyDecodable)]
+pub struct OpaqueHiddenType<'tcx> {
+    /// The span of this particular definition of the opaque type. So
+    /// for example:
+    ///
+    /// ```ignore (incomplete snippet)
+    /// type Foo = impl Baz;
+    /// fn bar() -> Foo {
+    /// //          ^^^ This is the span we are looking for!
+    /// }
+    /// ```
+    ///
+    /// In cases where the fn returns `(impl Trait, impl Trait)` or
+    /// other such combinations, the result is currently
+    /// over-approximated, but better than nothing.
+    pub span: Span,
+
+    /// The type variable that represents the value of the opaque type
+    /// that we require. In other words, after we compile this function,
+    /// we will be created a constraint like:
+    ///
+    ///     Foo<'a, T> = ?C
+    ///
+    /// where `?C` is the value of this type variable. =) It may
+    /// naturally refer to the type and lifetime parameters in scope
+    /// in this function, though ultimately it should only reference
+    /// those that are arguments to `Foo` in the constraint above. (In
+    /// other words, `?C` should not include `'b`, even though it's a
+    /// lifetime parameter on `foo`.)
+    pub ty: Ty<'tcx>,
 }
 
 rustc_index::newtype_index! {
@@ -1204,7 +1268,7 @@ pub type PlaceholderConst<'tcx> = Placeholder<BoundConst<'tcx>>;
 /// aren't allowed to call that query: it is equal to `type_of(const_param)` which is
 /// trivial to compute.
 ///
-/// If we now want to use that constant in a place which potentionally needs its type
+/// If we now want to use that constant in a place which potentially needs its type
 /// we also pass the type of its `const_param`. This is the point of `WithOptConstParam`,
 /// except that instead of a `Ty` we bundle the `DefId` of the const parameter.
 /// Meaning that we need to use `type_of(const_param_did)` if `const_param_did` is `Some`
@@ -2088,7 +2152,7 @@ impl<'tcx> TyCtxt<'tcx> {
         match instance {
             ty::InstanceDef::Item(def) => match self.def_kind(def.did) {
                 DefKind::Const
-                | DefKind::Static
+                | DefKind::Static(..)
                 | DefKind::AssocConst
                 | DefKind::Ctor(..)
                 | DefKind::AnonConst
@@ -2125,14 +2189,6 @@ impl<'tcx> TyCtxt<'tcx> {
         self.sess.contains_name(&self.get_attrs(did), attr)
     }
 
-    /// Determines whether an item is annotated with `doc(hidden)`.
-    pub fn is_doc_hidden(self, did: DefId) -> bool {
-        self.get_attrs(did)
-            .iter()
-            .filter_map(|attr| if attr.has_name(sym::doc) { attr.meta_item_list() } else { None })
-            .any(|items| items.iter().any(|item| item.has_name(sym::hidden)))
-    }
-
     /// Returns `true` if this is an `auto trait`.
     pub fn trait_is_auto(self, trait_def_id: DefId) -> bool {
         self.trait_def(trait_def_id).has_auto_impl
@@ -2150,13 +2206,18 @@ impl<'tcx> TyCtxt<'tcx> {
         self.impl_trait_ref(def_id).map(|tr| tr.def_id)
     }
 
-    /// If the given defid describes a method belonging to an impl, returns the
+    /// If the given `DefId` describes a method belonging to an impl, returns the
     /// `DefId` of the impl that the method belongs to; otherwise, returns `None`.
     pub fn impl_of_method(self, def_id: DefId) -> Option<DefId> {
         self.opt_associated_item(def_id).and_then(|trait_item| match trait_item.container {
             TraitContainer(_) => None,
             ImplContainer(def_id) => Some(def_id),
         })
+    }
+
+    /// If the given `DefId` belongs to a trait that was automatically derived, returns `true`.
+    pub fn is_builtin_derive(self, def_id: DefId) -> bool {
+        self.has_attr(def_id, sym::automatically_derived)
     }
 
     /// Looks up the span of `impl_did` if the impl is local; otherwise returns `Err`
@@ -2204,6 +2265,12 @@ impl<'tcx> TyCtxt<'tcx> {
 
     pub fn is_object_safe(self, key: DefId) -> bool {
         self.object_safety_violations(key).is_empty()
+    }
+
+    #[inline]
+    pub fn is_const_fn_raw(self, def_id: DefId) -> bool {
+        matches!(self.def_kind(def_id), DefKind::Fn | DefKind::AssocFn | DefKind::Ctor(..))
+            && self.impl_constness(def_id) == hir::Constness::Const
     }
 }
 
@@ -2285,6 +2352,7 @@ pub fn provide(providers: &mut ty::query::Providers) {
     super::middle::provide(providers);
     *providers = ty::query::Providers {
         trait_impls_of: trait_def::trait_impls_of_provider,
+        incoherent_impls: trait_def::incoherent_impls_provider,
         type_uninhabited_from: inhabitedness::type_uninhabited_from,
         const_param_default: consts::const_param_default,
         vtable_allocation: vtable::vtable_allocation_provider,
@@ -2300,6 +2368,7 @@ pub fn provide(providers: &mut ty::query::Providers) {
 #[derive(Clone, Debug, Default, HashStable)]
 pub struct CrateInherentImpls {
     pub inherent_impls: LocalDefIdMap<Vec<DefId>>,
+    pub incoherent_impls: FxHashMap<SimplifiedType, Vec<LocalDefId>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, TyEncodable, HashStable)]

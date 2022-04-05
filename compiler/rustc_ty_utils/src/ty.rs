@@ -8,7 +8,7 @@ use rustc_trait_selection::traits;
 
 fn sized_constraint_for_ty<'tcx>(
     tcx: TyCtxt<'tcx>,
-    adtdef: &ty::AdtDef,
+    adtdef: ty::AdtDef<'tcx>,
     ty: Ty<'tcx>,
 ) -> Vec<Ty<'tcx>> {
     use ty::TyKind::*;
@@ -56,7 +56,7 @@ fn sized_constraint_for_ty<'tcx>(
             })
             .without_const()
             .to_predicate(tcx);
-            let predicates = tcx.predicates_of(adtdef.did).predicates;
+            let predicates = tcx.predicates_of(adtdef.did()).predicates;
             if predicates.iter().any(|(p, _)| *p == sized_predicate) { vec![] } else { vec![ty] }
         }
 
@@ -77,15 +77,6 @@ fn impl_defaultness(tcx: TyCtxt<'_>, def_id: DefId) -> hir::Defaultness {
     }
 }
 
-fn impl_constness(tcx: TyCtxt<'_>, def_id: DefId) -> hir::Constness {
-    let item = tcx.hir().expect_item(def_id.expect_local());
-    if let hir::ItemKind::Impl(impl_) = &item.kind {
-        impl_.constness
-    } else {
-        bug!("`impl_constness` called on {:?}", item);
-    }
-}
-
 /// Calculates the `Sized` constraint.
 ///
 /// In fact, there are only a few options for the types in the constraint:
@@ -99,7 +90,7 @@ fn adt_sized_constraint(tcx: TyCtxt<'_>, def_id: DefId) -> ty::AdtSizedConstrain
     let def = tcx.adt_def(def_id);
 
     let result = tcx.mk_type_list(
-        def.variants
+        def.variants()
             .iter()
             .flat_map(|v| v.fields.last())
             .flat_map(|f| sized_constraint_for_ty(tcx, def, tcx.type_of(f.did))),
@@ -454,7 +445,7 @@ pub fn conservative_is_privately_uninhabited_raw<'tcx>(
             // (a) It has no variants (i.e. an empty `enum`);
             // (b) Each of its variants (a single one in the case of a `struct`) has at least
             //     one uninhabited field.
-            def.variants.iter().all(|var| {
+            def.variants().iter().all(|var| {
                 var.fields.iter().any(|field| {
                     let ty = tcx.type_of(field.did).subst(tcx, substs);
                     tcx.conservative_is_privately_uninhabited(param_env.and(ty))
@@ -498,7 +489,6 @@ pub fn provide(providers: &mut ty::query::Providers) {
         instance_def_size_estimate,
         issue33140_self_ty,
         impl_defaultness,
-        impl_constness,
         conservative_is_privately_uninhabited: conservative_is_privately_uninhabited_raw,
         ..*providers
     };

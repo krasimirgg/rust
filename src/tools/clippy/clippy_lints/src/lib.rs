@@ -23,6 +23,7 @@
 
 // FIXME: switch to something more ergonomic here, once available.
 // (Currently there is no way to opt into sysroot crates without `extern crate`.)
+extern crate rustc_arena;
 extern crate rustc_ast;
 extern crate rustc_ast_pretty;
 extern crate rustc_attr;
@@ -318,6 +319,7 @@ mod non_octal_unix_permissions;
 mod non_send_fields_in_send_ty;
 mod nonstandard_macro_braces;
 mod octal_escapes;
+mod only_used_in_recursion;
 mod open_options;
 mod option_env_unwrap;
 mod option_if_let_else;
@@ -505,6 +507,7 @@ pub fn register_plugins(store: &mut rustc_lint::LintStore, sess: &Session, conf:
         store.register_late_pass(|| Box::new(utils::internal_lints::LintWithoutLintPass::default()));
         store.register_late_pass(|| Box::new(utils::internal_lints::MatchTypeOnDiagItem));
         store.register_late_pass(|| Box::new(utils::internal_lints::OuterExpnDataPass));
+        store.register_late_pass(|| Box::new(utils::internal_lints::MsrvAttrImpl));
     }
 
     store.register_late_pass(|| Box::new(utils::author::Author));
@@ -856,6 +859,7 @@ pub fn register_plugins(store: &mut rustc_lint::LintStore, sess: &Session, conf:
     store.register_late_pass(move || Box::new(borrow_as_ptr::BorrowAsPtr::new(msrv)));
     store.register_late_pass(move || Box::new(manual_bits::ManualBits::new(msrv)));
     store.register_late_pass(|| Box::new(default_union_representation::DefaultUnionRepresentation));
+    store.register_late_pass(|| Box::new(only_used_in_recursion::OnlyUsedInRecursion));
     store.register_late_pass(|| Box::new(dbg_macro::DbgMacro));
     let cargo_ignore_publish = conf.cargo_ignore_publish;
     store.register_late_pass(move || {

@@ -13,12 +13,13 @@ use rustc_ast::{InlineAsmOptions, InlineAsmTemplatePiece};
 use rustc_data_structures::fingerprint::Fingerprint;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_data_structures::sorted_map::SortedMap;
+use rustc_error_messages::MultiSpan;
 use rustc_index::vec::IndexVec;
 use rustc_macros::HashStable_Generic;
 use rustc_span::hygiene::MacroKind;
 use rustc_span::source_map::Spanned;
 use rustc_span::symbol::{kw, sym, Ident, Symbol};
-use rustc_span::{def_id::LocalDefId, BytePos, MultiSpan, Span, DUMMY_SP};
+use rustc_span::{def_id::LocalDefId, BytePos, Span, DUMMY_SP};
 use rustc_target::asm::InlineAsmRegOrRegClass;
 use rustc_target::spec::abi::Abi;
 
@@ -59,7 +60,7 @@ pub enum ParamName {
     ///
     /// where `'f` is something like `Fresh(0)`. The indices are
     /// unique per impl, but not necessarily continuous.
-    Fresh(usize),
+    Fresh(LocalDefId),
 
     /// Indicates an illegal name was given and an error has been
     /// reported (so we should squelch other derived errors). Occurs
@@ -1118,7 +1119,7 @@ pub type BinOp = Spanned<BinOpKind>;
 
 #[derive(Copy, Clone, PartialEq, Encodable, Debug, HashStable_Generic)]
 pub enum UnOp {
-    /// The `*` operator (deferencing).
+    /// The `*` operator (dereferencing).
     Deref,
     /// The `!` operator (logical negation).
     Not,
@@ -1530,7 +1531,7 @@ impl Expr<'_> {
     pub fn is_place_expr(&self, mut allow_projections_from: impl FnMut(&Self) -> bool) -> bool {
         match self.kind {
             ExprKind::Path(QPath::Resolved(_, ref path)) => {
-                matches!(path.res, Res::Local(..) | Res::Def(DefKind::Static, _) | Res::Err)
+                matches!(path.res, Res::Local(..) | Res::Def(DefKind::Static(_), _) | Res::Err)
             }
 
             // Type ascription inherits its place expression kind from its
@@ -1611,7 +1612,7 @@ impl Expr<'_> {
             | ExprKind::Index(base, _)
             | ExprKind::AddrOf(.., base)
             | ExprKind::Cast(base, _) => {
-                // This isn't exactly true for `Index` and all `Unnary`, but we are using this
+                // This isn't exactly true for `Index` and all `Unary`, but we are using this
                 // method exclusively for diagnostics and there's a *cultural* pressure against
                 // them being used only for its side-effects.
                 base.can_have_side_effects()
@@ -3303,7 +3304,7 @@ mod size_asserts {
     rustc_data_structures::static_assert_size!(super::Expr<'static>, 56);
     rustc_data_structures::static_assert_size!(super::Pat<'static>, 88);
     rustc_data_structures::static_assert_size!(super::QPath<'static>, 24);
-    rustc_data_structures::static_assert_size!(super::Ty<'static>, 80);
+    rustc_data_structures::static_assert_size!(super::Ty<'static>, 72);
 
     rustc_data_structures::static_assert_size!(super::Item<'static>, 184);
     rustc_data_structures::static_assert_size!(super::TraitItem<'static>, 128);

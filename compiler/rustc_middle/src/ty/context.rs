@@ -7,7 +7,7 @@ use crate::infer::canonical::{Canonical, CanonicalVarInfo, CanonicalVarInfos};
 use crate::lint::{struct_lint_level, LintDiagnosticBuilder, LintLevelSource};
 use crate::middle::resolve_lifetime::{self, LifetimeScopeForPath};
 use crate::middle::stability;
-use crate::mir::interpret::{self, Allocation, ConstValue, Scalar};
+use crate::mir::interpret::{self, Allocation, ConstAllocation, ConstValue, Scalar};
 use crate::mir::{
     Body, BorrowCheckResult, Field, Local, Place, PlaceElem, ProjectionKind, Promoted,
 };
@@ -17,7 +17,7 @@ use crate::ty::query::{self, TyCtxtAt};
 use crate::ty::subst::{GenericArg, GenericArgKind, InternalSubsts, Subst, SubstsRef, UserSubsts};
 use crate::ty::TyKind::*;
 use crate::ty::{
-    self, AdtDef, AdtKind, Binder, BindingMode, BoundVar, CanonicalPolyFnSig,
+    self, AdtDef, AdtDefData, AdtKind, Binder, BindingMode, BoundVar, CanonicalPolyFnSig,
     ClosureSizeProfileData, Const, ConstS, ConstVid, DefIdTree, ExistentialPredicate, FloatTy,
     FloatVar, FloatVid, GenericParamDefKind, InferConst, InferTy, IntTy, IntVar, IntVid, List,
     ParamConst, ParamTy, PolyFnSig, Predicate, PredicateKind, PredicateS, ProjectionTy, Region,
@@ -33,7 +33,8 @@ use rustc_data_structures::sharded::{IntoPointer, ShardedHashMap};
 use rustc_data_structures::stable_hasher::{HashStable, StableHasher};
 use rustc_data_structures::steal::Steal;
 use rustc_data_structures::sync::{self, Lock, Lrc, WorkerLocal};
-use rustc_errors::ErrorReported;
+use rustc_data_structures::vec_map::VecMap;
+use rustc_errors::{ErrorGuaranteed, MultiSpan};
 use rustc_hir as hir;
 use rustc_hir::def::{DefKind, Res};
 use rustc_hir::def_id::{CrateNum, DefId, DefIdMap, LocalDefId, LOCAL_CRATE};
@@ -53,10 +54,10 @@ use rustc_session::lint::{Level, Lint};
 use rustc_session::Limit;
 use rustc_session::Session;
 use rustc_span::def_id::{DefPathHash, StableCrateId};
-use rustc_span::source_map::{MultiSpan, SourceMap};
+use rustc_span::source_map::SourceMap;
 use rustc_span::symbol::{kw, sym, Ident, Symbol};
 use rustc_span::{Span, DUMMY_SP};
-use rustc_target::abi::{Layout, TargetDataLayout, VariantIdx};
+use rustc_target::abi::{Layout, LayoutS, TargetDataLayout, VariantIdx};
 use rustc_target::spec::abi;
 
 use rustc_type_ir::TypeFlags;
@@ -91,7 +92,10 @@ pub trait OnDiskCache<'tcx>: rustc_data_structures::sync::Sync {
 /// except through the error-reporting functions on a [`tcx`][TyCtxt].
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq, PartialOrd, Ord)]
 #[derive(TyEncodable, TyDecodable, HashStable)]
-pub struct DelaySpanBugEmitted(());
+pub struct DelaySpanBugEmitted {
+    pub reported: ErrorGuaranteed,
+    _priv: (),
+}
 
 type InternedSet<'tcx, T> = ShardedHashMap<InternedInSet<'tcx, T>, ()>;
 
@@ -114,8 +118,8 @@ pub struct CtxtInterners<'tcx> {
     const_: InternedSet<'tcx, ConstS<'tcx>>,
     const_allocation: InternedSet<'tcx, Allocation>,
     bound_variable_kinds: InternedSet<'tcx, List<ty::BoundVariableKind>>,
-    layout: InternedSet<'tcx, Layout>,
-    adt_def: InternedSet<'tcx, AdtDef>,
+    layout: InternedSet<'tcx, LayoutS<'tcx>>,
+    adt_def: InternedSet<'tcx, AdtDefData>,
 }
 
 impl<'tcx> CtxtInterners<'tcx> {
@@ -369,7 +373,7 @@ pub struct TypeckResults<'tcx> {
 
     /// Resolved definitions for `<T>::X` associated paths and
     /// method calls, including those of overloaded operators.
-    type_dependent_defs: ItemLocalMap<Result<(DefKind, DefId), ErrorReported>>,
+    type_dependent_defs: ItemLocalMap<Result<(DefKind, DefId), ErrorGuaranteed>>,
 
     /// Resolved field indices for field accesses in expressions (`S { field }`, `obj.field`)
     /// or patterns (`S { field }`). The index is often useful by itself, but to learn more
@@ -479,12 +483,16 @@ pub struct TypeckResults<'tcx> {
     pub used_trait_imports: Lrc<FxHashSet<LocalDefId>>,
 
     /// If any errors occurred while type-checking this body,
-    /// this field will be set to `Some(ErrorReported)`.
-    pub tainted_by_errors: Option<ErrorReported>,
+    /// this field will be set to `Some(ErrorGuaranteed)`.
+    pub tainted_by_errors: Option<ErrorGuaranteed>,
 
-    /// All the opaque types that are restricted to concrete types
-    /// by this function.
-    pub concrete_opaque_types: FxHashSet<DefId>,
+    /// All the opaque types that have hidden types set
+    /// by this function. For return-position-impl-trait we also store the
+    /// type here, so that mir-borrowck can figure out hidden types,
+    /// even if they are only set in dead code (which doesn't show up in MIR).
+    /// For type-alias-impl-trait, this map is only used to prevent query cycles,
+    /// so the hidden types are all `None`.
+    pub concrete_opaque_types: VecMap<DefId, Option<Ty<'tcx>>>,
 
     /// Tracks the minimum captures required for a closure;
     /// see `MinCaptureInformationMap` for more details.
@@ -569,7 +577,7 @@ impl<'tcx> TypeckResults<'tcx> {
 
     pub fn type_dependent_defs(
         &self,
-    ) -> LocalTableInContext<'_, Result<(DefKind, DefId), ErrorReported>> {
+    ) -> LocalTableInContext<'_, Result<(DefKind, DefId), ErrorGuaranteed>> {
         LocalTableInContext { hir_owner: self.hir_owner, data: &self.type_dependent_defs }
     }
 
@@ -584,7 +592,7 @@ impl<'tcx> TypeckResults<'tcx> {
 
     pub fn type_dependent_defs_mut(
         &mut self,
-    ) -> LocalTableInContextMut<'_, Result<(DefKind, DefId), ErrorReported>> {
+    ) -> LocalTableInContextMut<'_, Result<(DefKind, DefId), ErrorGuaranteed>> {
         LocalTableInContextMut { hir_owner: self.hir_owner, data: &mut self.type_dependent_defs }
     }
 
@@ -1123,8 +1131,8 @@ impl<'tcx> TyCtxt<'tcx> {
         kind: AdtKind,
         variants: IndexVec<VariantIdx, ty::VariantDef>,
         repr: ReprOptions,
-    ) -> &'tcx ty::AdtDef {
-        self.intern_adt_def(ty::AdtDef::new(self, did, kind, variants, repr))
+    ) -> ty::AdtDef<'tcx> {
+        self.intern_adt_def(ty::AdtDefData::new(self, did, kind, variants, repr))
     }
 
     /// Allocates a read-only byte or string literal for `mir::interpret`.
@@ -1236,8 +1244,8 @@ impl<'tcx> TyCtxt<'tcx> {
     /// ensure it gets used.
     #[track_caller]
     pub fn ty_error_with_message<S: Into<MultiSpan>>(self, span: S, msg: &str) -> Ty<'tcx> {
-        self.sess.delay_span_bug(span, msg);
-        self.mk_ty(Error(DelaySpanBugEmitted(())))
+        let reported = self.sess.delay_span_bug(span, msg);
+        self.mk_ty(Error(DelaySpanBugEmitted { reported, _priv: () }))
     }
 
     /// Like [TyCtxt::ty_error] but for constants.
@@ -1258,8 +1266,11 @@ impl<'tcx> TyCtxt<'tcx> {
         span: S,
         msg: &str,
     ) -> Const<'tcx> {
-        self.sess.delay_span_bug(span, msg);
-        self.mk_const(ty::ConstS { val: ty::ConstKind::Error(DelaySpanBugEmitted(())), ty })
+        let reported = self.sess.delay_span_bug(span, msg);
+        self.mk_const(ty::ConstS {
+            val: ty::ConstKind::Error(DelaySpanBugEmitted { reported, _priv: () }),
+            ty,
+        })
     }
 
     pub fn consider_optimizing<T: Fn() -> String>(self, msg: T) -> bool {
@@ -1653,22 +1664,6 @@ pub trait Lift<'tcx>: fmt::Debug {
     fn lift_to_tcx(self, tcx: TyCtxt<'tcx>) -> Option<Self::Lifted>;
 }
 
-// Deprecated: we are in the process of converting all uses to `nop_lift`.
-macro_rules! nop_lift_old {
-    ($set:ident; $ty:ty => $lifted:ty) => {
-        impl<'a, 'tcx> Lift<'tcx> for $ty {
-            type Lifted = $lifted;
-            fn lift_to_tcx(self, tcx: TyCtxt<'tcx>) -> Option<Self::Lifted> {
-                if tcx.interners.$set.contains_pointer_to(&InternedInSet(self)) {
-                    Some(unsafe { mem::transmute(self) })
-                } else {
-                    None
-                }
-            }
-        }
-    };
-}
-
 macro_rules! nop_lift {
     ($set:ident; $ty:ty => $lifted:ty) => {
         impl<'a, 'tcx> Lift<'tcx> for $ty {
@@ -1726,7 +1721,7 @@ macro_rules! nop_list_lift {
 nop_lift! {type_; Ty<'a> => Ty<'tcx>}
 nop_lift! {region; Region<'a> => Region<'tcx>}
 nop_lift! {const_; Const<'a> => Const<'tcx>}
-nop_lift_old! {const_allocation; &'a Allocation => &'tcx Allocation}
+nop_lift! {const_allocation; ConstAllocation<'a> => ConstAllocation<'tcx>}
 nop_lift! {predicate; Predicate<'a> => Predicate<'tcx>}
 
 nop_list_lift! {poly_existential_predicates; ty::Binder<'a, ExistentialPredicate<'a>> => ty::Binder<'tcx, ExistentialPredicate<'tcx>>}
@@ -2161,49 +2156,9 @@ macro_rules! direct_interners {
 direct_interners! {
     region: mk_region(RegionKind): Region -> Region<'tcx>,
     const_: mk_const(ConstS<'tcx>): Const -> Const<'tcx>,
-}
-
-macro_rules! direct_interners_old {
-    ($($name:ident: $method:ident($ty:ty),)+) => {
-        $(impl<'tcx> Borrow<$ty> for InternedInSet<'tcx, $ty> {
-            fn borrow<'a>(&'a self) -> &'a $ty {
-                &self.0
-            }
-        }
-
-        impl<'tcx> PartialEq for InternedInSet<'tcx, $ty> {
-            fn eq(&self, other: &Self) -> bool {
-                // The `Borrow` trait requires that `x.borrow() == y.borrow()`
-                // equals `x == y`.
-                self.0 == other.0
-            }
-        }
-
-        impl<'tcx> Eq for InternedInSet<'tcx, $ty> {}
-
-        impl<'tcx> Hash for InternedInSet<'tcx, $ty> {
-            fn hash<H: Hasher>(&self, s: &mut H) {
-                // The `Borrow` trait requires that `x.borrow().hash(s) ==
-                // x.hash(s)`.
-                self.0.hash(s)
-            }
-        }
-
-        impl<'tcx> TyCtxt<'tcx> {
-            pub fn $method(self, v: $ty) -> &'tcx $ty {
-                self.interners.$name.intern(v, |v| {
-                    InternedInSet(self.interners.arena.alloc(v))
-                }).0
-            }
-        })+
-    }
-}
-
-// FIXME: eventually these should all be converted to `direct_interners`.
-direct_interners_old! {
-    const_allocation: intern_const_alloc(Allocation),
-    layout: intern_layout(Layout),
-    adt_def: intern_adt_def(AdtDef),
+    const_allocation: intern_const_alloc(Allocation): ConstAllocation -> ConstAllocation<'tcx>,
+    layout: intern_layout(LayoutS<'tcx>): Layout -> Layout<'tcx>,
+    adt_def: intern_adt_def(AdtDefData): AdtDef -> AdtDef<'tcx>,
 }
 
 macro_rules! slice_interners {
@@ -2357,7 +2312,7 @@ impl<'tcx> TyCtxt<'tcx> {
     }
 
     #[inline]
-    pub fn mk_adt(self, def: &'tcx AdtDef, substs: SubstsRef<'tcx>) -> Ty<'tcx> {
+    pub fn mk_adt(self, def: AdtDef<'tcx>, substs: SubstsRef<'tcx>) -> Ty<'tcx> {
         // Take a copy of substs so that we own the vectors inside.
         self.mk_ty(Adt(def, substs))
     }
@@ -2579,12 +2534,12 @@ impl<'tcx> TyCtxt<'tcx> {
     pub fn mk_place_downcast(
         self,
         place: Place<'tcx>,
-        adt_def: &'tcx AdtDef,
+        adt_def: AdtDef<'tcx>,
         variant_index: VariantIdx,
     ) -> Place<'tcx> {
         self.mk_place_elem(
             place,
-            PlaceElem::Downcast(Some(adt_def.variants[variant_index].name), variant_index),
+            PlaceElem::Downcast(Some(adt_def.variant(variant_index).name), variant_index),
         )
     }
 
@@ -2755,7 +2710,7 @@ impl<'tcx> TyCtxt<'tcx> {
                 return bound;
             }
 
-            if hir.attrs(id).iter().any(|attr| Level::from_symbol(attr.name_or_empty()).is_some()) {
+            if hir.attrs(id).iter().any(|attr| Level::from_attr(attr).is_some()) {
                 return id;
             }
             let next = hir.get_parent_node(id);
@@ -2789,7 +2744,7 @@ impl<'tcx> TyCtxt<'tcx> {
         lint: &'static Lint,
         hir_id: HirId,
         span: impl Into<MultiSpan>,
-        decorate: impl for<'a> FnOnce(LintDiagnosticBuilder<'a>),
+        decorate: impl for<'a> FnOnce(LintDiagnosticBuilder<'a, ()>),
     ) {
         let (level, src) = self.lint_level_at_node(lint, hir_id);
         struct_lint_level(self.sess, lint, level, src, Some(span.into()), decorate);
@@ -2799,7 +2754,7 @@ impl<'tcx> TyCtxt<'tcx> {
         self,
         lint: &'static Lint,
         id: HirId,
-        decorate: impl for<'a> FnOnce(LintDiagnosticBuilder<'a>),
+        decorate: impl for<'a> FnOnce(LintDiagnosticBuilder<'a, ()>),
     ) {
         let (level, src) = self.lint_level_at_node(lint, id);
         struct_lint_level(self.sess, lint, level, src, None, decorate);
@@ -2999,11 +2954,6 @@ pub fn provide(providers: &mut ty::query::Providers) {
         tcx.arena.alloc(tcx.resolutions(()).glob_map.get(&id).cloned().unwrap_or_default())
     };
 
-    providers.lookup_stability = |tcx, id| tcx.stability().local_stability(id.expect_local());
-    providers.lookup_const_stability =
-        |tcx, id| tcx.stability().local_const_stability(id.expect_local());
-    providers.lookup_deprecation_entry =
-        |tcx, id| tcx.stability().local_deprecation_entry(id.expect_local());
     providers.extern_mod_stmt_cnum =
         |tcx, id| tcx.resolutions(()).extern_crate_map.get(&id).cloned();
     providers.output_filenames = |tcx, ()| &tcx.output_filenames;

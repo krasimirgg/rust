@@ -127,7 +127,10 @@ impl<'tcx> Visitor<'tcx> for UnsafetyChecker<'_, 'tcx> {
                 &AggregateKind::Closure(def_id, _) | &AggregateKind::Generator(def_id, _, _) => {
                     let UnsafetyCheckResult { violations, used_unsafe_blocks, .. } =
                         self.tcx.unsafety_check_result(def_id.expect_local());
-                    self.register_violations(violations, used_unsafe_blocks);
+                    self.register_violations(
+                        violations,
+                        used_unsafe_blocks.iter().map(|(&h, &d)| (h, d)),
+                    );
                 }
             },
             _ => {}
@@ -146,14 +149,14 @@ impl<'tcx> Visitor<'tcx> for UnsafetyChecker<'_, 'tcx> {
             self.check_mut_borrowing_layout_constrained_field(*place, context.is_mutating_use());
         }
 
-        // Some checks below need the extra metainfo of the local declaration.
+        // Some checks below need the extra meta info of the local declaration.
         let decl = &self.body.local_decls[place.local];
 
         // Check the base local: it might be an unsafe-to-access static. We only check derefs of the
         // temporary holding the static pointer to avoid duplicate errors
         // <https://github.com/rust-lang/rust/pull/78068#issuecomment-731753506>.
         if decl.internal && place.projection.first() == Some(&ProjectionElem::Deref) {
-            // If the projection root is an artifical local that we introduced when
+            // If the projection root is an artificial local that we introduced when
             // desugaring `static`, give a more specific error message
             // (avoid the general "raw pointer" clause below, that would only be confusing).
             if let Some(box LocalInfo::StaticRef { def_id, .. }) = decl.local_info {
@@ -261,7 +264,7 @@ impl<'tcx> UnsafetyChecker<'_, 'tcx> {
     fn register_violations<'a>(
         &mut self,
         violations: impl IntoIterator<Item = &'a UnsafetyViolation>,
-        new_used_unsafe_blocks: impl IntoIterator<Item = (&'a HirId, &'a UsedUnsafeBlockData)>,
+        new_used_unsafe_blocks: impl IntoIterator<Item = (HirId, UsedUnsafeBlockData)>,
     ) {
         use UsedUnsafeBlockData::{AllAllowedInUnsafeFn, SomeDisallowedInUnsafeFn};
 
@@ -318,7 +321,7 @@ impl<'tcx> UnsafetyChecker<'_, 'tcx> {
 
         new_used_unsafe_blocks
             .into_iter()
-            .for_each(|(&hir_id, &usage_data)| update_entry(self, hir_id, usage_data));
+            .for_each(|(hir_id, usage_data)| update_entry(self, hir_id, usage_data));
     }
     fn check_mut_borrowing_layout_constrained_field(
         &mut self,
@@ -333,7 +336,7 @@ impl<'tcx> UnsafetyChecker<'_, 'tcx> {
                 ProjectionElem::Field(..) => {
                     let ty = place_base.ty(&self.body.local_decls, self.tcx).ty;
                     if let ty::Adt(def, _) = ty.kind() {
-                        if self.tcx.layout_scalar_valid_range(def.did)
+                        if self.tcx.layout_scalar_valid_range(def.did())
                             != (Bound::Unbounded, Bound::Unbounded)
                         {
                             let details = if is_mut_use {
@@ -551,7 +554,6 @@ fn report_unused_unsafe(tcx: TyCtxt<'_>, kind: UnusedUnsafe, id: HirId) {
                     tcx.lint_level_at_node(UNSAFE_OP_IN_UNSAFE_FN, usage_lint_root);
                 assert_eq!(level, Level::Allow);
                 lint::explain_lint_level_source(
-                    tcx.sess,
                     UNSAFE_OP_IN_UNSAFE_FN,
                     Level::Allow,
                     source,

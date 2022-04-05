@@ -510,7 +510,7 @@ pub struct WhereEqPredicate {
 pub struct Crate {
     pub attrs: Vec<Attribute>,
     pub items: Vec<P<Item>>,
-    pub span: Span,
+    pub spans: ModSpans,
     /// Must be equal to `CRATE_NODE_ID` after the crate root is expanded, but may hold
     /// expansion placeholders or an unassigned value (`DUMMY_NODE_ID`) before that.
     pub id: NodeId,
@@ -1616,7 +1616,7 @@ pub enum StrStyle {
     /// A raw string, like `r##"foo"##`.
     ///
     /// The value is the number of `#` symbols used.
-    Raw(u16),
+    Raw(u8),
 }
 
 /// An AST literal.
@@ -2317,9 +2317,23 @@ pub enum ModKind {
     /// or with definition outlined to a separate file `mod foo;` and already loaded from it.
     /// The inner span is from the first token past `{` to the last token until `}`,
     /// or from the first to the last token in the loaded file.
-    Loaded(Vec<P<Item>>, Inline, Span),
+    Loaded(Vec<P<Item>>, Inline, ModSpans),
     /// Module with definition outlined to a separate file `mod foo;` but not yet loaded from it.
     Unloaded,
+}
+
+#[derive(Copy, Clone, Encodable, Decodable, Debug)]
+pub struct ModSpans {
+    /// `inner_span` covers the body of the module; for a file module, its the whole file.
+    /// For an inline module, its the span inside the `{ ... }`, not including the curly braces.
+    pub inner_span: Span,
+    pub inject_use_span: Span,
+}
+
+impl Default for ModSpans {
+    fn default() -> ModSpans {
+        ModSpans { inner_span: Default::default(), inject_use_span: Default::default() }
+    }
 }
 
 /// Foreign module declaration.
@@ -2662,10 +2676,37 @@ pub struct Trait {
     pub items: Vec<P<AssocItem>>,
 }
 
+/// The location of a where clause on a `TyAlias` (`Span`) and whether there was
+/// a `where` keyword (`bool`). This is split out from `WhereClause`, since there
+/// are two locations for where clause on type aliases, but their predicates
+/// are concatenated together.
+///
+/// Take this example:
+/// ```ignore (only-for-syntax-highlight)
+/// trait Foo {
+///   type Assoc<'a, 'b> where Self: 'a, Self: 'b;
+/// }
+/// impl Foo for () {
+///   type Assoc<'a, 'b> where Self: 'a = () where Self: 'b;
+///   //                 ^^^^^^^^^^^^^^ first where clause
+///   //                                     ^^^^^^^^^^^^^^ second where clause
+/// }
+/// ```
+///
+/// If there is no where clause, then this is `false` with `DUMMY_SP`.
+#[derive(Copy, Clone, Encodable, Decodable, Debug, Default)]
+pub struct TyAliasWhereClause(pub bool, pub Span);
+
 #[derive(Clone, Encodable, Decodable, Debug)]
 pub struct TyAlias {
     pub defaultness: Defaultness,
     pub generics: Generics,
+    /// The span information for the two where clauses (before equals, after equals)
+    pub where_clauses: (TyAliasWhereClause, TyAliasWhereClause),
+    /// The index in `generics.where_clause.predicates` that would split into
+    /// predicates from the where clause before the equals and the predicates
+    /// from the where clause after the equals
+    pub where_predicates_split: usize,
     pub bounds: GenericBounds,
     pub ty: Option<P<Ty>>,
 }

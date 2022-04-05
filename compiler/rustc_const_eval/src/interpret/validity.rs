@@ -21,7 +21,7 @@ use std::hash::Hash;
 
 use super::{
     alloc_range, CheckInAllocMsg, GlobalAlloc, InterpCx, InterpResult, MPlaceTy, Machine,
-    MemPlaceMeta, OpTy, ScalarMaybeUninit, ValueVisitor,
+    MemPlaceMeta, OpTy, Scalar, ScalarMaybeUninit, ValueVisitor,
 };
 
 macro_rules! throw_validation_failure {
@@ -267,7 +267,7 @@ impl<'rt, 'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> ValidityVisitor<'rt, 'mir, '
                 match layout.variants {
                     Variants::Single { index } => {
                         // Inside a variant
-                        PathElem::Field(def.variants[index].fields[field].name)
+                        PathElem::Field(def.variant(index).fields[field].name)
                     }
                     Variants::Multiple { .. } => bug!("we handled variants above"),
                 }
@@ -315,7 +315,7 @@ impl<'rt, 'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> ValidityVisitor<'rt, 'mir, '
                 let vtable = self.ecx.scalar_to_ptr(meta.unwrap_meta());
                 // Direct call to `check_ptr_access_align` checks alignment even on CTFE machines.
                 try_validation!(
-                    self.ecx.memory.check_ptr_access_align(
+                    self.ecx.check_ptr_access_align(
                         vtable,
                         3 * self.ecx.tcx.data_layout.pointer_size, // drop, size, align
                         self.ecx.tcx.data_layout.pointer_align.abi,
@@ -403,7 +403,7 @@ impl<'rt, 'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> ValidityVisitor<'rt, 'mir, '
             .unwrap_or_else(|| (place.layout.size, place.layout.align.abi));
         // Direct call to `check_ptr_access_align` checks alignment even on CTFE machines.
         try_validation!(
-            self.ecx.memory.check_ptr_access_align(
+            self.ecx.check_ptr_access_align(
                 place.ptr,
                 size,
                 align,
@@ -432,9 +432,8 @@ impl<'rt, 'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> ValidityVisitor<'rt, 'mir, '
         if let Some(ref mut ref_tracking) = self.ref_tracking {
             // Proceed recursively even for ZST, no reason to skip them!
             // `!` is a ZST and we want to validate it.
-            // Skip validation entirely for some external statics
-            if let Ok((alloc_id, _offset, _ptr)) = self.ecx.memory.ptr_try_get_alloc(place.ptr) {
-                // not a ZST
+            if let Ok((alloc_id, _offset, _ptr)) = self.ecx.ptr_try_get_alloc_id(place.ptr) {
+                // Special handling for pointers to statics (irrespective of their type).
                 let alloc_kind = self.ecx.tcx.get_global_alloc(alloc_id);
                 if let Some(GlobalAlloc::Static(did)) = alloc_kind {
                     assert!(!self.ecx.tcx.is_thread_local_static(did));
@@ -469,7 +468,7 @@ impl<'rt, 'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> ValidityVisitor<'rt, 'mir, '
                 // We need to clone the path anyway, make sure it gets created
                 // with enough space for the additional `Deref`.
                 let mut new_path = Vec::with_capacity(path.len() + 1);
-                new_path.clone_from(path);
+                new_path.extend(path);
                 new_path.push(PathElem::Deref);
                 new_path
             });
@@ -522,8 +521,11 @@ impl<'rt, 'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> ValidityVisitor<'rt, 'mir, '
                 // NOTE: Keep this in sync with the array optimization for int/float
                 // types below!
                 if M::enforce_number_validity(self.ecx) {
-                    // Integers/floats in CTFE: Must be scalar bits, pointers are dangerous
-                    let is_bits = value.check_init().map_or(false, |v| v.try_to_int().is_ok());
+                    // Integers/floats with number validity: Must be scalar bits, pointers are dangerous.
+                    // As a special exception we *do* match on a `Scalar` here, since we truly want
+                    // to know its underlying representation (and *not* cast it to an integer).
+                    let is_bits =
+                        value.check_init().map_or(false, |v| matches!(v, Scalar::Int(..)));
                     if !is_bits {
                         throw_validation_failure!(self.path,
                             { "{:x}", value } expected { "initialized plain (non-pointer) bytes" }
@@ -577,7 +579,7 @@ impl<'rt, 'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> ValidityVisitor<'rt, 'mir, '
                 if let Some(_) = self.ref_tracking {
                     let ptr = self.ecx.scalar_to_ptr(value);
                     let _fn = try_validation!(
-                        self.ecx.memory.get_fn(ptr),
+                        self.ecx.get_ptr_fn(ptr),
                         self.path,
                         err_ub!(DanglingIntPointer(0, _)) =>
                             { "a null function pointer" },
@@ -734,7 +736,7 @@ impl<'rt, 'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> ValueVisitor<'mir, 'tcx, M>
         new_op: &OpTy<'tcx, M::PointerTag>,
     ) -> InterpResult<'tcx> {
         let name = match old_op.layout.ty.kind() {
-            ty::Adt(adt, _) => PathElem::Variant(adt.variants[variant_id].name),
+            ty::Adt(adt, _) => PathElem::Variant(adt.variant(variant_id).name),
             // Generators also have variants
             ty::Generator(..) => PathElem::GeneratorState(variant_id),
             _ => bug!("Unexpected type with variant: {:?}", old_op.layout.ty),
@@ -771,7 +773,7 @@ impl<'rt, 'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> ValueVisitor<'mir, 'tcx, M>
         // Special check preventing `UnsafeCell` in the inner part of constants
         if let Some(def) = op.layout.ty.ty_adt_def() {
             if matches!(self.ctfe_mode, Some(CtfeValidationMode::Const { inner: true, .. }))
-                && Some(def.did) == self.ecx.tcx.lang_items().unsafe_cell_type()
+                && Some(def.did()) == self.ecx.tcx.lang_items().unsafe_cell_type()
             {
                 throw_validation_failure!(self.path, { "`UnsafeCell` in a `const`" });
             }
@@ -823,7 +825,7 @@ impl<'rt, 'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> ValueVisitor<'mir, 'tcx, M>
                 let mplace = op.assert_mem_place(); // strings are never immediate
                 let len = mplace.len(self.ecx)?;
                 try_validation!(
-                    self.ecx.memory.read_bytes(mplace.ptr, Size::from_bytes(len)),
+                    self.ecx.read_bytes_ptr(mplace.ptr, Size::from_bytes(len)),
                     self.path,
                     err_ub!(InvalidUninitBytes(..)) => { "uninitialized data in `str`" },
                     err_unsup!(ReadPointerAsBytes) => { "a pointer in `str`" },
@@ -859,7 +861,7 @@ impl<'rt, 'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> ValueVisitor<'mir, 'tcx, M>
                 // to reject those pointers, we just do not have the machinery to
                 // talk about parts of a pointer.
                 // We also accept uninit, for consistency with the slow path.
-                let Some(alloc) = self.ecx.memory.get(mplace.ptr, size, mplace.align)? else {
+                let Some(alloc) = self.ecx.get_ptr_alloc(mplace.ptr, size, mplace.align)? else {
                     // Size 0, nothing more to check.
                     return Ok(());
                 };

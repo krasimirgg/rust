@@ -126,6 +126,7 @@ pub fn parse_config(args: Vec<String>) -> Config {
         .reqopt("", "cc", "path to a C compiler", "PATH")
         .reqopt("", "cxx", "path to a C++ compiler", "PATH")
         .reqopt("", "cflags", "flags for the C compiler", "FLAGS")
+        .reqopt("", "cxxflags", "flags for the CXX compiler", "FLAGS")
         .optopt("", "ar", "path to an archiver", "PATH")
         .optopt("", "linker", "path to a linker", "PATH")
         .reqopt("", "llvm-components", "list of LLVM components built in", "LIST")
@@ -288,6 +289,7 @@ pub fn parse_config(args: Vec<String>) -> Config {
         cc: matches.opt_str("cc").unwrap(),
         cxx: matches.opt_str("cxx").unwrap(),
         cflags: matches.opt_str("cflags").unwrap(),
+        cxxflags: matches.opt_str("cxxflags").unwrap(),
         ar: matches.opt_str("ar").unwrap_or_else(|| String::from("ar")),
         linker: matches.opt_str("linker"),
         llvm_components: matches.opt_str("llvm-components").unwrap(),
@@ -484,11 +486,6 @@ fn configure_lldb(config: &Config) -> Option<Config> {
         );
         return None;
     }
-
-    // Some older versions of LLDB seem to have problems with multiple
-    // instances running in parallel, so only run one test thread at a
-    // time.
-    env::set_var("RUST_TEST_THREADS", "1");
 
     Some(Config { debugger: Some(Debugger::Lldb), ..config.clone() })
 }

@@ -32,7 +32,9 @@ struct SyntaxChecker<'a, 'tcx> {
 impl<'a, 'tcx> SyntaxChecker<'a, 'tcx> {
     fn check_rust_syntax(&self, item: &clean::Item, dox: &str, code_block: RustCodeBlock) {
         let buffer = Lrc::new(Lock::new(Buffer::default()));
-        let emitter = BufferEmitter { buffer: Lrc::clone(&buffer) };
+        let fallback_bundle = rustc_errors::fallback_fluent_bundle(false)
+            .expect("failed to load fallback fluent bundle");
+        let emitter = BufferEmitter { buffer: Lrc::clone(&buffer), fallback_bundle };
 
         let sm = Lrc::new(SourceMap::new(FilePathMapping::empty()));
         let handler = Handler::with_emitter(false, None, Box::new(emitter));
@@ -67,11 +69,11 @@ impl<'a, 'tcx> SyntaxChecker<'a, 'tcx> {
             return;
         }
 
-        let local_id = match item.def_id.as_def_id().and_then(|x| x.as_local()) {
-            Some(id) => id,
+        let Some(local_id) = item.def_id.as_def_id().and_then(|x| x.as_local())
+        else {
             // We don't need to check the syntax for other crates so returning
             // without doing anything should not be a problem.
-            None => return,
+            return;
         };
 
         let hir_id = self.cx.tcx.hir().local_def_id_to_hir_id(local_id);
@@ -91,7 +93,7 @@ impl<'a, 'tcx> SyntaxChecker<'a, 'tcx> {
 
         // lambda that will use the lint to start a new diagnostic and add
         // a suggestion to it when needed.
-        let diag_builder = |lint: LintDiagnosticBuilder<'_>| {
+        let diag_builder = |lint: LintDiagnosticBuilder<'_, ()>| {
             let explanation = if is_ignore {
                 "`ignore` code blocks require valid Rust code for syntax highlighting; \
                     mark blocks that do not contain Rust code as text"
@@ -171,12 +173,14 @@ struct Buffer {
 
 struct BufferEmitter {
     buffer: Lrc<Lock<Buffer>>,
+    fallback_bundle: Lrc<rustc_errors::FluentBundle>,
 }
 
 impl Emitter for BufferEmitter {
     fn emit_diagnostic(&mut self, diag: &Diagnostic) {
         let mut buffer = self.buffer.borrow_mut();
-        buffer.messages.push(format!("error from rustc: {}", diag.message[0].0));
+        // FIXME(davidtwco): need to support translation here eventually
+        buffer.messages.push(format!("error from rustc: {}", diag.message[0].0.expect_str()));
         if diag.is_error() {
             buffer.has_errors = true;
         }
@@ -184,5 +188,13 @@ impl Emitter for BufferEmitter {
 
     fn source_map(&self) -> Option<&Lrc<SourceMap>> {
         None
+    }
+
+    fn fluent_bundle(&self) -> Option<&Lrc<rustc_errors::FluentBundle>> {
+        None
+    }
+
+    fn fallback_fluent_bundle(&self) -> &Lrc<rustc_errors::FluentBundle> {
+        &self.fallback_bundle
     }
 }

@@ -1,4 +1,4 @@
-use super::{CompileTimeEvalContext, CompileTimeInterpreter, ConstEvalErr, MemoryExtra};
+use super::{CompileTimeEvalContext, CompileTimeInterpreter, ConstEvalErr};
 use crate::interpret::eval_nullary_intrinsic;
 use crate::interpret::{
     intern_const_alloc_recursive, Allocation, ConstAlloc, ConstValue, CtfeValidationMode, GlobalId,
@@ -38,7 +38,7 @@ fn eval_body_using_ecx<'mir, 'tcx>(
             || matches!(
                 ecx.tcx.def_kind(cid.instance.def_id()),
                 DefKind::Const
-                    | DefKind::Static
+                    | DefKind::Static(_)
                     | DefKind::ConstParam
                     | DefKind::AnonConst
                     | DefKind::InlineConst
@@ -100,8 +100,7 @@ pub(super) fn mk_eval_cx<'mir, 'tcx>(
         tcx,
         root_span,
         param_env,
-        CompileTimeInterpreter::new(tcx.const_eval_limit()),
-        MemoryExtra { can_access_statics },
+        CompileTimeInterpreter::new(tcx.const_eval_limit(), can_access_statics),
     )
 }
 
@@ -285,10 +284,9 @@ pub fn eval_to_allocation_raw_provider<'tcx>(
         tcx,
         tcx.def_span(def.did),
         key.param_env,
-        CompileTimeInterpreter::new(tcx.const_eval_limit()),
         // Statics (and promoteds inside statics) may access other statics, because unlike consts
         // they do not have to behave "as if" they were evaluated at runtime.
-        MemoryExtra { can_access_statics: is_static },
+        CompileTimeInterpreter::new(tcx.const_eval_limit(), /*can_access_statics:*/ is_static),
     );
 
     let res = ecx.load_mir(cid.instance.def, cid.promoted);
@@ -367,7 +365,7 @@ pub fn eval_to_allocation_raw_provider<'tcx>(
                             "the raw bytes of the constant ({}",
                             display_allocation(
                                 *ecx.tcx,
-                                ecx.tcx.global_alloc(alloc_id).unwrap_memory()
+                                ecx.tcx.global_alloc(alloc_id).unwrap_memory().inner()
                             )
                         ));
                     },

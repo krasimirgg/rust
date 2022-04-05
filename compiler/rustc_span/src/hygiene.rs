@@ -85,9 +85,16 @@ rustc_index::newtype_index! {
     /// A unique ID associated with a macro invocation and expansion.
     pub struct LocalExpnId {
         ENCODABLE = custom
+        ORD_IMPL = custom
         DEBUG_FORMAT = "expn{}"
     }
 }
+
+// To ensure correctness of incremental compilation,
+// `LocalExpnId` must not implement `Ord` or `PartialOrd`.
+// See https://github.com/rust-lang/rust/issues/90317.
+impl !Ord for LocalExpnId {}
+impl !PartialOrd for LocalExpnId {}
 
 /// Assert that the provided `HashStableContext` is configured with the 'default'
 /// `HashingControls`. We should always have bailed out before getting to here
@@ -1170,7 +1177,7 @@ pub struct HygieneEncodeContext {
     /// that we don't accidentally try to encode any more `SyntaxContexts`
     serialized_ctxts: Lock<FxHashSet<SyntaxContext>>,
     /// The `SyntaxContexts` that we have serialized (e.g. as a result of encoding `Spans`)
-    /// in the most recent 'round' of serializnig. Serializing `SyntaxContextData`
+    /// in the most recent 'round' of serializing. Serializing `SyntaxContextData`
     /// may cause us to serialize more `SyntaxContext`s, so serialize in a loop
     /// until we reach a fixed point.
     latest_ctxts: Lock<FxHashSet<SyntaxContext>>,

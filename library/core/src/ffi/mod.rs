@@ -57,6 +57,9 @@ type_alias! { "c_schar.md", c_schar = i8, NonZero_c_schar = NonZeroI8; }
 type_alias! { "c_uchar.md", c_uchar = u8, NonZero_c_uchar = NonZeroU8; }
 type_alias! { "c_short.md", c_short = i16, NonZero_c_short = NonZeroI16; }
 type_alias! { "c_ushort.md", c_ushort = u16, NonZero_c_ushort = NonZeroU16; }
+#[cfg(any(target_arch = "avr", target_arch = "msp430"))]
+type_alias! { "c_int.md", c_int = i16, NonZero_c_int = NonZeroI16; }
+#[cfg(not(any(target_arch = "avr", target_arch = "msp430")))]
 type_alias! { "c_int.md", c_int = i32, NonZero_c_int = NonZeroI32; }
 type_alias! { "c_uint.md", c_uint = u32, NonZero_c_uint = NonZeroU32; }
 type_alias! { "c_long.md", c_long = i32, NonZero_c_long = NonZeroI32;
@@ -117,7 +120,7 @@ mod c_char_definition {
             all(target_os = "android", any(target_arch = "aarch64", target_arch = "arm")),
             all(target_os = "l4re", target_arch = "x86_64"),
             all(
-                target_os = "freebsd",
+                any(target_os = "freebsd", target_os = "openbsd"),
                 any(
                     target_arch = "aarch64",
                     target_arch = "arm",
@@ -130,7 +133,6 @@ mod c_char_definition {
                 target_os = "netbsd",
                 any(target_arch = "aarch64", target_arch = "arm", target_arch = "powerpc")
             ),
-            all(target_os = "openbsd", target_arch = "aarch64"),
             all(
                 target_os = "vxworks",
                 any(

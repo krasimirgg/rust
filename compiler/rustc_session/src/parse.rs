@@ -7,12 +7,15 @@ use rustc_ast::node_id::NodeId;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_data_structures::sync::{Lock, Lrc};
 use rustc_errors::{emitter::SilentEmitter, ColorConfig, Handler};
-use rustc_errors::{error_code, Applicability, Diagnostic, DiagnosticBuilder, ErrorReported};
+use rustc_errors::{
+    error_code, fallback_fluent_bundle, Applicability, Diagnostic, DiagnosticBuilder,
+    ErrorGuaranteed, MultiSpan,
+};
 use rustc_feature::{find_feature_issue, GateIssue, UnstableFeatures};
 use rustc_span::edition::Edition;
 use rustc_span::hygiene::ExpnId;
 use rustc_span::source_map::{FilePathMapping, SourceMap};
-use rustc_span::{MultiSpan, Span, Symbol};
+use rustc_span::{Span, Symbol};
 
 use std::str;
 
@@ -69,7 +72,7 @@ pub struct SymbolGallery {
 
 impl SymbolGallery {
     /// Insert a symbol and its span into symbol gallery.
-    /// If the symbol has occurred before, ignore the new occurance.
+    /// If the symbol has occurred before, ignore the new occurrence.
     pub fn insert(&self, symbol: Symbol, span: Span) {
         self.symbols.lock().entry(symbol).or_insert(span);
     }
@@ -82,7 +85,7 @@ pub fn feature_err<'a>(
     feature: Symbol,
     span: impl Into<MultiSpan>,
     explain: &str,
-) -> DiagnosticBuilder<'a, ErrorReported> {
+) -> DiagnosticBuilder<'a, ErrorGuaranteed> {
     feature_err_issue(sess, feature, span, GateIssue::Language, explain)
 }
 
@@ -96,22 +99,38 @@ pub fn feature_err_issue<'a>(
     span: impl Into<MultiSpan>,
     issue: GateIssue,
     explain: &str,
-) -> DiagnosticBuilder<'a, ErrorReported> {
+) -> DiagnosticBuilder<'a, ErrorGuaranteed> {
     let mut err = sess.span_diagnostic.struct_span_err_with_code(span, explain, error_code!(E0658));
+    add_feature_diagnostics_for_issue(&mut err, sess, feature, issue);
+    err
+}
 
+/// Adds the diagnostics for a feature to an existing error.
+pub fn add_feature_diagnostics<'a>(err: &mut Diagnostic, sess: &'a ParseSess, feature: Symbol) {
+    add_feature_diagnostics_for_issue(err, sess, feature, GateIssue::Language);
+}
+
+/// Adds the diagnostics for a feature to an existing error.
+///
+/// This variant allows you to control whether it is a library or language feature.
+/// Almost always, you want to use this for a language feature. If so, prefer
+/// `add_feature_diagnostics`.
+pub fn add_feature_diagnostics_for_issue<'a>(
+    err: &mut Diagnostic,
+    sess: &'a ParseSess,
+    feature: Symbol,
+    issue: GateIssue,
+) {
     if let Some(n) = find_feature_issue(feature, issue) {
         err.note(&format!(
-            "see issue #{} <https://github.com/rust-lang/rust/issues/{}> for more information",
-            n, n,
+            "see issue #{n} <https://github.com/rust-lang/rust/issues/{n}> for more information"
         ));
     }
 
     // #23973: do not suggest `#![feature(...)]` if we are in beta/stable
     if sess.unstable_features.is_nightly_build() {
-        err.help(&format!("add `#![feature({})]` to the crate attributes to enable", feature));
+        err.help(&format!("add `#![feature({feature})]` to the crate attributes to enable"));
     }
-
-    err
 }
 
 /// Info about a parsing session.
@@ -155,8 +174,17 @@ pub struct ParseSess {
 impl ParseSess {
     /// Used for testing.
     pub fn new(file_path_mapping: FilePathMapping) -> Self {
+        let fallback_bundle =
+            fallback_fluent_bundle(false).expect("failed to load fallback fluent bundle");
         let sm = Lrc::new(SourceMap::new(file_path_mapping));
-        let handler = Handler::with_tty_emitter(ColorConfig::Auto, true, None, Some(sm.clone()));
+        let handler = Handler::with_tty_emitter(
+            ColorConfig::Auto,
+            true,
+            None,
+            Some(sm.clone()),
+            None,
+            fallback_bundle,
+        );
         ParseSess::with_span_handler(handler, sm)
     }
 
@@ -185,8 +213,11 @@ impl ParseSess {
     }
 
     pub fn with_silent_emitter(fatal_note: Option<String>) -> Self {
+        let fallback_bundle =
+            fallback_fluent_bundle(false).expect("failed to load fallback fluent bundle");
         let sm = Lrc::new(SourceMap::new(FilePathMapping::empty()));
-        let fatal_handler = Handler::with_tty_emitter(ColorConfig::Auto, false, None, None);
+        let fatal_handler =
+            Handler::with_tty_emitter(ColorConfig::Auto, false, None, None, None, fallback_bundle);
         let handler = Handler::with_emitter(
             false,
             None,

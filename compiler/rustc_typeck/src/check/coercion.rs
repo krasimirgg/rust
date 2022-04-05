@@ -18,7 +18,7 @@
 //!
 //! ## Subtle note
 //!
-//! When infering the generic arguments of functions, the argument
+//! When inferring the generic arguments of functions, the argument
 //! order is relevant, which can lead to the following edge case:
 //!
 //! ```rust
@@ -37,7 +37,9 @@
 
 use crate::astconv::AstConv;
 use crate::check::FnCtxt;
-use rustc_errors::{struct_span_err, Applicability, Diagnostic, DiagnosticBuilder, ErrorReported};
+use rustc_errors::{
+    struct_span_err, Applicability, Diagnostic, DiagnosticBuilder, ErrorGuaranteed,
+};
 use rustc_hir as hir;
 use rustc_hir::def_id::DefId;
 use rustc_infer::infer::type_variable::{TypeVariableOrigin, TypeVariableOriginKind};
@@ -1270,7 +1272,7 @@ impl<'tcx, 'exprs, E: AsCoercionSite> CoerceMany<'tcx, 'exprs, E> {
 
     /// Returns the current "merged type", representing our best-guess
     /// at the LUB of the expressions we've seen so far (if any). This
-    /// isn't *final* until you call `self.final()`, which will return
+    /// isn't *final* until you call `self.complete()`, which will return
     /// the merged type.
     pub fn merged_ty(&self) -> Ty<'tcx> {
         self.final_ty.unwrap_or(self.expected_ty)
@@ -1520,7 +1522,7 @@ impl<'tcx, 'exprs, E: AsCoercionSite> CoerceMany<'tcx, 'exprs, E> {
         fcx: &FnCtxt<'a, 'tcx>,
         id: hir::HirId,
         expression: Option<(&'tcx hir::Expr<'tcx>, hir::HirId)>,
-    ) -> DiagnosticBuilder<'a, ErrorReported> {
+    ) -> DiagnosticBuilder<'a, ErrorGuaranteed> {
         let mut err = fcx.report_mismatched_types(cause, expected, found, ty_err);
 
         let mut pointing_at_return_type = false;

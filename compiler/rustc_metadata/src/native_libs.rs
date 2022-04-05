@@ -1,3 +1,4 @@
+use rustc_ast::CRATE_NODE_ID;
 use rustc_attr as attr;
 use rustc_data_structures::fx::FxHashSet;
 use rustc_errors::struct_span_err;
@@ -21,7 +22,7 @@ crate fn collect(tcx: TyCtxt<'_>) -> Vec<NativeLib> {
 
 crate fn relevant_lib(sess: &Session, lib: &NativeLib) -> bool {
     match lib.cfg {
-        Some(ref cfg) => attr::cfg_matches(cfg, &sess.parse_sess, None),
+        Some(ref cfg) => attr::cfg_matches(cfg, &sess.parse_sess, CRATE_NODE_ID, None),
         None => true,
     }
 }
@@ -125,13 +126,18 @@ impl<'tcx> ItemLikeVisitor<'tcx> for Collector<'tcx> {
 
             // Do this outside the above loop so we don't depend on modifiers coming
             // after kinds
-            if let Some(item) = items.iter().find(|item| item.has_name(sym::modifiers)) {
+            let mut modifiers_count = 0;
+            for item in items.iter().filter(|item| item.has_name(sym::modifiers)) {
                 if let Some(modifiers) = item.value_str() {
+                    modifiers_count += 1;
                     let span = item.name_value_literal_span().unwrap();
+                    let mut has_duplicate_modifiers = false;
                     for modifier in modifiers.as_str().split(',') {
                         let (modifier, value) = match modifier.strip_prefix(&['+', '-']) {
                             Some(m) => (m, modifier.starts_with('+')),
                             None => {
+                                // Note: this error also excludes the case with empty modifier
+                                // string, like `modifiers = ""`.
                                 sess.span_err(
                                     span,
                                     "invalid linking modifier syntax, expected '+' or '-' prefix \
@@ -143,49 +149,81 @@ impl<'tcx> ItemLikeVisitor<'tcx> for Collector<'tcx> {
 
                         match (modifier, &mut lib.kind) {
                             ("bundle", NativeLibKind::Static { bundle, .. }) => {
+                                if bundle.is_some() {
+                                    has_duplicate_modifiers = true;
+                                }
                                 *bundle = Some(value);
                             }
-                            ("bundle", _) => sess.span_err(
-                                span,
-                                "bundle linking modifier is only compatible with \
+                            ("bundle", _) => {
+                                sess.span_err(
+                                    span,
+                                    "bundle linking modifier is only compatible with \
                                 `static` linking kind",
-                            ),
+                                );
+                            }
 
-                            ("verbatim", _) => lib.verbatim = Some(value),
+                            ("verbatim", _) => {
+                                if lib.verbatim.is_some() {
+                                    has_duplicate_modifiers = true;
+                                }
+                                lib.verbatim = Some(value);
+                            }
 
                             ("whole-archive", NativeLibKind::Static { whole_archive, .. }) => {
+                                if whole_archive.is_some() {
+                                    has_duplicate_modifiers = true;
+                                }
                                 *whole_archive = Some(value);
                             }
-                            ("whole-archive", _) => sess.span_err(
-                                span,
-                                "whole-archive linking modifier is only compatible with \
+                            ("whole-archive", _) => {
+                                sess.span_err(
+                                    span,
+                                    "whole-archive linking modifier is only compatible with \
                                 `static` linking kind",
-                            ),
+                                );
+                            }
 
                             ("as-needed", NativeLibKind::Dylib { as_needed })
                             | ("as-needed", NativeLibKind::Framework { as_needed }) => {
+                                if as_needed.is_some() {
+                                    has_duplicate_modifiers = true;
+                                }
                                 *as_needed = Some(value);
                             }
-                            ("as-needed", _) => sess.span_err(
-                                span,
-                                "as-needed linking modifier is only compatible with \
+                            ("as-needed", _) => {
+                                sess.span_err(
+                                    span,
+                                    "as-needed linking modifier is only compatible with \
                                 `dylib` and `framework` linking kinds",
-                            ),
+                                );
+                            }
 
-                            _ => sess.span_err(
-                                span,
-                                &format!(
-                                    "unrecognized linking modifier `{}`, expected one \
+                            _ => {
+                                sess.span_err(
+                                    span,
+                                    &format!(
+                                        "unrecognized linking modifier `{}`, expected one \
                                     of: bundle, verbatim, whole-archive, as-needed",
-                                    modifier
-                                ),
-                            ),
+                                        modifier
+                                    ),
+                                );
+                            }
                         }
+                    }
+                    if has_duplicate_modifiers {
+                        let msg =
+                            "same modifier is used multiple times in a single `modifiers` argument";
+                        sess.span_err(item.span(), msg);
                     }
                 } else {
                     let msg = "must be of the form `#[link(modifiers = \"...\")]`";
                     sess.span_err(item.span(), msg);
                 }
+            }
+
+            if modifiers_count > 1 {
+                let msg = "multiple `modifiers` arguments in a single `#[link]` attribute";
+                sess.span_err(m.span, msg);
             }
 
             // In general we require #[link(name = "...")] but we allow
@@ -247,7 +285,9 @@ impl Collector<'_> {
                 Some(span) => {
                     struct_span_err!(self.tcx.sess, span, E0455, "{}", msg).emit();
                 }
-                None => self.tcx.sess.err(msg),
+                None => {
+                    self.tcx.sess.err(msg);
+                }
             }
         }
         if lib.cfg.is_some() && !self.tcx.features().link_cfg {
@@ -339,6 +379,15 @@ impl Collector<'_> {
                 .drain_filter(|lib| {
                     if let Some(lib_name) = lib.name {
                         if lib_name.as_str() == passed_lib.name {
+                            // FIXME: This whole logic is questionable, whether modifiers are
+                            // involved or not, library reordering and kind overriding without
+                            // explicit `:rename` in particular.
+                            if lib.has_modifiers() || passed_lib.has_modifiers() {
+                                self.tcx.sess.span_err(
+                                    self.tcx.def_span(lib.foreign_module.unwrap()),
+                                    "overriding linking modifiers from command line is not supported"
+                                );
+                            }
                             if passed_lib.kind != NativeLibKind::Unspecified {
                                 lib.kind = passed_lib.kind;
                             }
@@ -393,7 +442,7 @@ impl Collector<'_> {
                     .layout;
                 // In both stdcall and fastcall, we always round up the argument size to the
                 // nearest multiple of 4 bytes.
-                (layout.size.bytes_usize() + 3) & !3
+                (layout.size().bytes_usize() + 3) & !3
             })
             .sum()
     }

@@ -4,7 +4,7 @@ use rustc_trait_selection::infer::InferCtxtExt as _;
 use rustc_trait_selection::traits::ObligationCause;
 
 use rustc_ast::util::parser::PREC_POSTFIX;
-use rustc_errors::{Applicability, Diagnostic, DiagnosticBuilder, ErrorReported};
+use rustc_errors::{Applicability, Diagnostic, DiagnosticBuilder, ErrorGuaranteed};
 use rustc_hir as hir;
 use rustc_hir::lang_items::LangItem;
 use rustc_hir::{is_range_literal, Node};
@@ -39,6 +39,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         self.suggest_no_capture_closure(err, expected, expr_ty);
         self.suggest_boxing_when_appropriate(err, expr, expected, expr_ty);
         self.suggest_missing_parentheses(err, expr);
+        self.suggest_block_to_brackets_peeling_refs(err, expr, expr_ty, expected);
         self.note_need_for_fn_pointer(err, expected, expr_ty);
         self.note_internal_mutation_in_method(err, expr, expected, expr_ty);
         self.report_closure_inferred_return_type(err, expected);
@@ -57,7 +58,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         sp: Span,
         expected: Ty<'tcx>,
         actual: Ty<'tcx>,
-    ) -> Option<DiagnosticBuilder<'tcx, ErrorReported>> {
+    ) -> Option<DiagnosticBuilder<'tcx, ErrorGuaranteed>> {
         self.demand_suptype_with_origin(&self.misc(sp), expected, actual)
     }
 
@@ -67,7 +68,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         cause: &ObligationCause<'tcx>,
         expected: Ty<'tcx>,
         actual: Ty<'tcx>,
-    ) -> Option<DiagnosticBuilder<'tcx, ErrorReported>> {
+    ) -> Option<DiagnosticBuilder<'tcx, ErrorGuaranteed>> {
         match self.at(cause, self.param_env).sup(expected, actual) {
             Ok(InferOk { obligations, value: () }) => {
                 self.register_predicates(obligations);
@@ -88,7 +89,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         sp: Span,
         expected: Ty<'tcx>,
         actual: Ty<'tcx>,
-    ) -> Option<DiagnosticBuilder<'tcx, ErrorReported>> {
+    ) -> Option<DiagnosticBuilder<'tcx, ErrorGuaranteed>> {
         self.demand_eqtype_with_origin(&self.misc(sp), expected, actual)
     }
 
@@ -97,7 +98,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         cause: &ObligationCause<'tcx>,
         expected: Ty<'tcx>,
         actual: Ty<'tcx>,
-    ) -> Option<DiagnosticBuilder<'tcx, ErrorReported>> {
+    ) -> Option<DiagnosticBuilder<'tcx, ErrorGuaranteed>> {
         match self.at(cause, self.param_env).eq(expected, actual) {
             Ok(InferOk { obligations, value: () }) => {
                 self.register_predicates(obligations);
@@ -134,7 +135,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         expected: Ty<'tcx>,
         expected_ty_expr: Option<&'tcx hir::Expr<'tcx>>,
         allow_two_phase: AllowTwoPhase,
-    ) -> (Ty<'tcx>, Option<DiagnosticBuilder<'tcx, ErrorReported>>) {
+    ) -> (Ty<'tcx>, Option<DiagnosticBuilder<'tcx, ErrorGuaranteed>>) {
         let expected = self.resolve_vars_with_obligations(expected);
 
         let e = match self.try_coerce(expr, checked_ty, expected, allow_two_phase, None) {
@@ -184,7 +185,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         hir::Path {
                             res:
                                 hir::def::Res::Def(
-                                    hir::def::DefKind::Static | hir::def::DefKind::Const,
+                                    hir::def::DefKind::Static(_) | hir::def::DefKind::Const,
                                     def_id,
                                 ),
                             ..
@@ -268,29 +269,43 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         expr_ty: Ty<'tcx>,
     ) {
         if let ty::Adt(expected_adt, substs) = expected.kind() {
-            if !expected_adt.is_enum() {
-                return;
-            }
-
             // If the expression is of type () and it's the return expression of a block,
             // we suggest adding a separate return expression instead.
             // (To avoid things like suggesting `Ok(while .. { .. })`.)
             if expr_ty.is_unit() {
+                let mut id = expr.hir_id;
+                let mut parent;
+
+                // Unroll desugaring, to make sure this works for `for` loops etc.
+                loop {
+                    parent = self.tcx.hir().get_parent_node(id);
+                    if let Some(parent_span) = self.tcx.hir().opt_span(parent) {
+                        if parent_span.find_ancestor_inside(expr.span).is_some() {
+                            // The parent node is part of the same span, so is the result of the
+                            // same expansion/desugaring and not the 'real' parent node.
+                            id = parent;
+                            continue;
+                        }
+                    }
+                    break;
+                }
+
                 if let Some(hir::Node::Block(&hir::Block {
                     span: block_span, expr: Some(e), ..
-                })) = self.tcx.hir().find(self.tcx.hir().get_parent_node(expr.hir_id))
+                })) = self.tcx.hir().find(parent)
                 {
-                    if e.hir_id == expr.hir_id {
+                    if e.hir_id == id {
                         if let Some(span) = expr.span.find_ancestor_inside(block_span) {
-                            let return_suggestions =
-                                if self.tcx.is_diagnostic_item(sym::Result, expected_adt.did) {
-                                    vec!["Ok(())".to_string()]
-                                } else if self.tcx.is_diagnostic_item(sym::Option, expected_adt.did)
-                                {
-                                    vec!["None".to_string(), "Some(())".to_string()]
-                                } else {
-                                    return;
-                                };
+                            let return_suggestions = if self
+                                .tcx
+                                .is_diagnostic_item(sym::Result, expected_adt.did())
+                            {
+                                vec!["Ok(())".to_string()]
+                            } else if self.tcx.is_diagnostic_item(sym::Option, expected_adt.did()) {
+                                vec!["None".to_string(), "Some(())".to_string()]
+                            } else {
+                                return;
+                            };
                             if let Some(indent) =
                                 self.tcx.sess.source_map().indentation_before(span.shrink_to_lo())
                             {
@@ -316,9 +331,11 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             }
 
             let compatible_variants: Vec<String> = expected_adt
-                .variants
+                .variants()
                 .iter()
-                .filter(|variant| variant.fields.len() == 1)
+                .filter(|variant| {
+                    variant.fields.len() == 1 && variant.ctor_kind == hir::def::CtorKind::Fn
+                })
                 .filter_map(|variant| {
                     let sole_field = &variant.fields[0];
                     let sole_field_ty = sole_field.ty(self.tcx, substs);
@@ -361,7 +378,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     err.multipart_suggestions(
                         &format!(
                             "try wrapping the expression in a variant of `{}`",
-                            self.tcx.def_path_str(expected_adt.did)
+                            self.tcx.def_path_str(expected_adt.did())
                         ),
                         compatible_variants.into_iter().map(|variant| {
                             vec![

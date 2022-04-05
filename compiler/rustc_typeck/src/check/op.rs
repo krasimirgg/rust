@@ -299,52 +299,52 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     IsAssign::No => {
                         let (message, missing_trait, use_output) = match op.node {
                             hir::BinOpKind::Add => (
-                                format!("cannot add `{}` to `{}`", rhs_ty, lhs_ty),
+                                format!("cannot add `{rhs_ty}` to `{lhs_ty}`"),
                                 Some("std::ops::Add"),
                                 true,
                             ),
                             hir::BinOpKind::Sub => (
-                                format!("cannot subtract `{}` from `{}`", rhs_ty, lhs_ty),
+                                format!("cannot subtract `{rhs_ty}` from `{lhs_ty}`"),
                                 Some("std::ops::Sub"),
                                 true,
                             ),
                             hir::BinOpKind::Mul => (
-                                format!("cannot multiply `{}` by `{}`", lhs_ty, rhs_ty),
+                                format!("cannot multiply `{lhs_ty}` by `{rhs_ty}`"),
                                 Some("std::ops::Mul"),
                                 true,
                             ),
                             hir::BinOpKind::Div => (
-                                format!("cannot divide `{}` by `{}`", lhs_ty, rhs_ty),
+                                format!("cannot divide `{lhs_ty}` by `{rhs_ty}`"),
                                 Some("std::ops::Div"),
                                 true,
                             ),
                             hir::BinOpKind::Rem => (
-                                format!("cannot mod `{}` by `{}`", lhs_ty, rhs_ty),
+                                format!("cannot mod `{lhs_ty}` by `{rhs_ty}`"),
                                 Some("std::ops::Rem"),
                                 true,
                             ),
                             hir::BinOpKind::BitAnd => (
-                                format!("no implementation for `{} & {}`", lhs_ty, rhs_ty),
+                                format!("no implementation for `{lhs_ty} & {rhs_ty}`"),
                                 Some("std::ops::BitAnd"),
                                 true,
                             ),
                             hir::BinOpKind::BitXor => (
-                                format!("no implementation for `{} ^ {}`", lhs_ty, rhs_ty),
+                                format!("no implementation for `{lhs_ty} ^ {rhs_ty}`"),
                                 Some("std::ops::BitXor"),
                                 true,
                             ),
                             hir::BinOpKind::BitOr => (
-                                format!("no implementation for `{} | {}`", lhs_ty, rhs_ty),
+                                format!("no implementation for `{lhs_ty} | {rhs_ty}`"),
                                 Some("std::ops::BitOr"),
                                 true,
                             ),
                             hir::BinOpKind::Shl => (
-                                format!("no implementation for `{} << {}`", lhs_ty, rhs_ty),
+                                format!("no implementation for `{lhs_ty} << {rhs_ty}`"),
                                 Some("std::ops::Shl"),
                                 true,
                             ),
                             hir::BinOpKind::Shr => (
-                                format!("no implementation for `{} >> {}`", lhs_ty, rhs_ty),
+                                format!("no implementation for `{lhs_ty} >> {rhs_ty}`"),
                                 Some("std::ops::Shr"),
                                 true,
                             ),
@@ -477,8 +477,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                                 // When we know that a missing bound is responsible, we don't show
                                 // this note as it is redundant.
                                 err.note(&format!(
-                                    "the trait `{}` is not implemented for `{}`",
-                                    missing_trait, lhs_ty
+                                    "the trait `{missing_trait}` is not implemented for `{lhs_ty}`"
                                 ));
                             }
                         } else {
@@ -576,7 +575,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
 
         let string_type = self.tcx.get_diagnostic_item(sym::String);
         let is_std_string = |ty: Ty<'tcx>| match ty.ty_adt_def() {
-            Some(ty_def) => Some(ty_def.did) == string_type,
+            Some(ty_def) => Some(ty_def.did()) == string_type,
             None => false,
         };
 
@@ -672,6 +671,25 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         ex.span,
                         format!("cannot apply unary operator `{}`", op.as_str()),
                     );
+                    let missing_trait = match op {
+                        hir::UnOp::Deref => unreachable!("check unary op `-` or `!` only"),
+                        hir::UnOp::Not => "std::ops::Not",
+                        hir::UnOp::Neg => "std::ops::Neg",
+                    };
+                    let mut visitor = TypeParamVisitor(vec![]);
+                    visitor.visit_ty(operand_ty);
+                    if let [ty] = &visitor.0[..] && let ty::Param(p) = *operand_ty.kind() {
+                        suggest_constraining_param(
+                            self.tcx,
+                            self.body_id,
+                            &mut err,
+                            *ty,
+                            operand_ty,
+                            missing_trait,
+                            p,
+                            true,
+                        );
+                    }
 
                     let sp = self.tcx.sess.source_map().start_point(ex.span);
                     if let Some(sp) =
@@ -701,10 +719,9 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                                     err.span_suggestion(
                                         ex.span,
                                         &format!(
-                                            "you may have meant the maximum value of `{}`",
-                                            actual
+                                            "you may have meant the maximum value of `{actual}`",
                                         ),
-                                        format!("{}::MAX", actual),
+                                        format!("{actual}::MAX"),
                                         Applicability::MaybeIncorrect,
                                     );
                                 }
@@ -835,7 +852,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
 }
 
 // Binary operator categories. These categories summarize the behavior
-// with respect to the builtin operationrs supported.
+// with respect to the builtin operations supported.
 enum BinOpCategory {
     /// &&, || -- cannot be overridden
     Shortcircuit,
@@ -967,7 +984,7 @@ fn suggest_constraining_param(
     set_output: bool,
 ) {
     let hir = tcx.hir();
-    let msg = &format!("`{}` might need a bound for `{}`", lhs_ty, missing_trait);
+    let msg = &format!("`{lhs_ty}` might need a bound for `{missing_trait}`");
     // Try to find the def-id and details for the parameter p. We have only the index,
     // so we have to find the enclosing function's def-id, then look through its declared
     // generic parameters to get the declaration.
@@ -981,13 +998,13 @@ fn suggest_constraining_param(
         .as_ref()
         .and_then(|node| node.generics())
     {
-        let output = if set_output { format!("<Output = {}>", rhs_ty) } else { String::new() };
+        let output = if set_output { format!("<Output = {rhs_ty}>") } else { String::new() };
         suggest_constraining_type_param(
             tcx,
             generics,
             &mut err,
-            &format!("{}", lhs_ty),
-            &format!("{}{}", missing_trait, output),
+            &lhs_ty.to_string(),
+            &format!("{missing_trait}{output}"),
             None,
         );
     } else {

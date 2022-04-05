@@ -431,10 +431,10 @@ fn test_show() {
     set.insert(1);
     set.insert(2);
 
-    let set_str = format!("{:?}", set);
+    let set_str = format!("{set:?}");
 
     assert_eq!(set_str, "{1, 2}");
-    assert_eq!(format!("{:?}", empty), "{}");
+    assert_eq!(format!("{empty:?}"), "{}");
 }
 
 #[test]
@@ -609,7 +609,7 @@ fn assert_send() {
 
 #[allow(dead_code)]
 // Check that the member-like functions conditionally provided by #[derive()]
-// are not overriden by genuine member functions with a different signature.
+// are not overridden by genuine member functions with a different signature.
 fn assert_derives() {
     fn hash<T: Hash, H: Hasher>(v: BTreeSet<T>, state: &mut H) {
         v.hash(state);
@@ -649,7 +649,7 @@ fn test_ord_absence() {
     }
 
     fn set_debug<K: Debug>(set: BTreeSet<K>) {
-        format!("{:?}", set);
+        format!("{set:?}");
         format!("{:?}", set.iter());
         format!("{:?}", set.into_iter());
     }

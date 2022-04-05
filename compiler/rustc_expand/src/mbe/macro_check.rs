@@ -109,10 +109,11 @@ use crate::mbe::{KleeneToken, TokenTree};
 use rustc_ast::token::{DelimToken, Token, TokenKind};
 use rustc_ast::{NodeId, DUMMY_NODE_ID};
 use rustc_data_structures::fx::FxHashMap;
+use rustc_errors::MultiSpan;
 use rustc_session::lint::builtin::META_VARIABLE_MISUSE;
 use rustc_session::parse::ParseSess;
 use rustc_span::symbol::kw;
-use rustc_span::{symbol::MacroRulesNormalizedIdent, MultiSpan, Span};
+use rustc_span::{symbol::MacroRulesNormalizedIdent, Span};
 
 use smallvec::SmallVec;
 
@@ -249,7 +250,7 @@ fn check_binders(
             if let Some(prev_info) = binders.get(&name) {
                 // 1. The meta-variable is already bound in the current LHS: This is an error.
                 let mut span = MultiSpan::from_span(span);
-                span.push_span_label(prev_info.span, "previous declaration".into());
+                span.push_span_label(prev_info.span, "previous declaration");
                 buffer_lint(sess, span, node_id, "duplicate matcher binding");
             } else if get_binder_info(macros, binders, name).is_none() {
                 // 2. The meta-variable is free: This is a binder.
@@ -278,8 +279,10 @@ fn check_binders(
                 binders.insert(name, BinderInfo { span, ops: ops.into() });
             }
         }
+        // `MetaVarExpr` can not appear in the LHS of a macro arm
+        TokenTree::MetaVarExpr(..) => {}
         TokenTree::Delimited(_, ref del) => {
-            for tt in &del.tts {
+            for tt in del.inner_tts() {
                 check_binders(sess, node_id, tt, macros, binders, ops, valid);
             }
         }
@@ -335,8 +338,14 @@ fn check_occurrences(
             let name = MacroRulesNormalizedIdent::new(name);
             check_ops_is_prefix(sess, node_id, macros, binders, ops, span, name);
         }
+        TokenTree::MetaVarExpr(dl, ref mve) => {
+            let Some(name) = mve.ident().map(MacroRulesNormalizedIdent::new) else {
+                return;
+            };
+            check_ops_is_prefix(sess, node_id, macros, binders, ops, dl.entire(), name);
+        }
         TokenTree::Delimited(_, ref del) => {
-            check_nested_occurrences(sess, node_id, &del.tts, macros, binders, ops, valid);
+            check_nested_occurrences(sess, node_id, del.inner_tts(), macros, binders, ops, valid);
         }
         TokenTree::Sequence(_, ref seq) => {
             let ops = ops.push(seq.kleene);
@@ -423,14 +432,20 @@ fn check_nested_occurrences(
             {
                 let macro_rules = state == NestedMacroState::MacroRulesNotName;
                 state = NestedMacroState::Empty;
-                let rest =
-                    check_nested_macro(sess, node_id, macro_rules, &del.tts, &nested_macros, valid);
+                let rest = check_nested_macro(
+                    sess,
+                    node_id,
+                    macro_rules,
+                    del.inner_tts(),
+                    &nested_macros,
+                    valid,
+                );
                 // If we did not check the whole macro definition, then check the rest as if outside
                 // the macro definition.
                 check_nested_occurrences(
                     sess,
                     node_id,
-                    &del.tts[rest..],
+                    &del.inner_tts()[rest..],
                     macros,
                     binders,
                     ops,
@@ -607,7 +622,7 @@ fn ops_is_prefix(
     for (i, binder) in binder_ops.iter().enumerate() {
         if i >= occurrence_ops.len() {
             let mut span = MultiSpan::from_span(span);
-            span.push_span_label(binder.span, "expected repetition".into());
+            span.push_span_label(binder.span, "expected repetition");
             let message = &format!("variable '{}' is still repeating at this depth", name);
             buffer_lint(sess, span, node_id, message);
             return;
@@ -615,8 +630,8 @@ fn ops_is_prefix(
         let occurrence = &occurrence_ops[i];
         if occurrence.op != binder.op {
             let mut span = MultiSpan::from_span(span);
-            span.push_span_label(binder.span, "expected repetition".into());
-            span.push_span_label(occurrence.span, "conflicting repetition".into());
+            span.push_span_label(binder.span, "expected repetition");
+            span.push_span_label(occurrence.span, "conflicting repetition");
             let message = "meta-variable repeats with different Kleene operator";
             buffer_lint(sess, span, node_id, message);
             return;

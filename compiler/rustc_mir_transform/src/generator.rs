@@ -210,7 +210,7 @@ struct SuspensionPoint<'tcx> {
 
 struct TransformVisitor<'tcx> {
     tcx: TyCtxt<'tcx>,
-    state_adt_ref: &'tcx AdtDef,
+    state_adt_ref: AdtDef<'tcx>,
     state_substs: SubstsRef<'tcx>,
 
     // The type of the discriminant in the generator struct
@@ -243,11 +243,11 @@ impl<'tcx> TransformVisitor<'tcx> {
         val: Operand<'tcx>,
         source_info: SourceInfo,
     ) -> impl Iterator<Item = Statement<'tcx>> {
-        let kind = AggregateKind::Adt(self.state_adt_ref.did, idx, self.state_substs, None, None);
-        assert_eq!(self.state_adt_ref.variants[idx].fields.len(), 1);
+        let kind = AggregateKind::Adt(self.state_adt_ref.did(), idx, self.state_substs, None, None);
+        assert_eq!(self.state_adt_ref.variant(idx).fields.len(), 1);
         let ty = self
             .tcx
-            .type_of(self.state_adt_ref.variants[idx].fields[0].did)
+            .type_of(self.state_adt_ref.variant(idx).fields[0].did)
             .subst(self.tcx, self.state_substs);
         expand_aggregate(
             Place::return_place(),
@@ -500,7 +500,7 @@ fn locals_live_across_suspend_points<'tcx>(
                 // The `liveness` variable contains the liveness of MIR locals ignoring borrows.
                 // This is correct for movable generators since borrows cannot live across
                 // suspension points. However for immovable generators we need to account for
-                // borrows, so we conseratively assume that all borrowed locals are live until
+                // borrows, so we conservatively assume that all borrowed locals are live until
                 // we find a StorageDead statement referencing the locals.
                 // To do this we just union our `liveness` result with `borrowed_locals`, which
                 // contains all the locals which has been borrowed before this suspension point.
@@ -1235,7 +1235,7 @@ fn create_cases<'tcx>(
 
 impl<'tcx> MirPass<'tcx> for StateTransform {
     fn phase_change(&self) -> Option<MirPhase> {
-        Some(MirPhase::GeneratorLowering)
+        Some(MirPhase::GeneratorsLowered)
     }
 
     fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {

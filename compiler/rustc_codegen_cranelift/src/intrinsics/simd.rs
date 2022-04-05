@@ -159,7 +159,7 @@ pub(super) fn codegen_simd_intrinsic_call<'tcx>(
                 let idx_bytes = match idx_const {
                     ConstValue::ByRef { alloc, offset } => {
                         let size = Size::from_bytes(4 * ret_lane_count /* size_of([u32; ret_lane_count]) */);
-                        alloc.get_bytes(fx, alloc_range(offset, size)).unwrap()
+                        alloc.inner().get_bytes(fx, alloc_range(offset, size)).unwrap()
                     }
                     _ => unreachable!("{:?}", idx_const),
                 };
@@ -409,6 +409,7 @@ pub(super) fn codegen_simd_intrinsic_call<'tcx>(
         };
 
         simd_reduce_add_ordered | simd_reduce_add_unordered, (c v, v acc) {
+            // FIXME there must be no acc param for integer vectors
             if !v.layout().ty.is_simd() {
                 report_simd_type_validation_error(fx, intrinsic, span, v.layout().ty);
                 return;
@@ -424,6 +425,7 @@ pub(super) fn codegen_simd_intrinsic_call<'tcx>(
         };
 
         simd_reduce_mul_ordered | simd_reduce_mul_unordered, (c v, v acc) {
+            // FIXME there must be no acc param for integer vectors
             if !v.layout().ty.is_simd() {
                 report_simd_type_validation_error(fx, intrinsic, span, v.layout().ty);
                 return;

@@ -23,7 +23,7 @@ use crate::traits::query::{
     CanonicalTypeOpProvePredicateGoal, CanonicalTypeOpSubtypeGoal, NoSolution,
 };
 use crate::traits::query::{
-    DropckOutlivesResult, DtorckConstraint, MethodAutoderefStepsResult, NormalizationResult,
+    DropckConstraint, DropckOutlivesResult, MethodAutoderefStepsResult, NormalizationResult,
     OutlivesBound,
 };
 use crate::traits::specialization_graph;
@@ -37,7 +37,7 @@ use rustc_data_structures::fx::{FxHashMap, FxHashSet, FxIndexMap};
 use rustc_data_structures::steal::Steal;
 use rustc_data_structures::svh::Svh;
 use rustc_data_structures::sync::Lrc;
-use rustc_errors::ErrorReported;
+use rustc_errors::ErrorGuaranteed;
 use rustc_hir as hir;
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::{CrateNum, DefId, DefIdMap, DefIdSet, LocalDefId};
@@ -337,7 +337,7 @@ rustc_query_append! { [define_callbacks!][<'tcx>] }
 mod sealed {
     use super::{DefId, LocalDefId};
 
-    /// An analogue of the `Into` trait that's intended only for query paramaters.
+    /// An analogue of the `Into` trait that's intended only for query parameters.
     ///
     /// This exists to allow queries to accept either `DefId` or `LocalDefId` while requiring that the
     /// user call `to_def_id` to convert between them everywhere else.

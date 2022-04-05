@@ -16,7 +16,6 @@ use std::path::{Path, PathBuf};
 use std::process::{exit, Command, Stdio};
 use std::str;
 
-use build_helper::{output, t, up_to_date};
 use serde::Deserialize;
 
 use crate::builder::Cargo;
@@ -26,9 +25,9 @@ use crate::config::{LlvmLibunwind, TargetSelection};
 use crate::dist;
 use crate::native;
 use crate::tool::SourceType;
-use crate::util::{exe, is_debug_info, is_dylib, symlink_dir};
+use crate::util::{exe, is_debug_info, is_dylib, output, symlink_dir, t, up_to_date};
 use crate::LLVM_TOOLS;
-use crate::{Compiler, DependencyType, GitRepo, Mode};
+use crate::{CLang, Compiler, DependencyType, GitRepo, Mode};
 
 #[derive(Debug, PartialOrd, Ord, Copy, Clone, PartialEq, Eq, Hash)]
 pub struct Std {
@@ -249,7 +248,7 @@ fn copy_self_contained_objects(
         }
     } else if target.contains("windows-gnu") {
         for obj in ["crt2.o", "dllcrt2.o"].iter() {
-            let src = compiler_file(builder, builder.cc(target), target, obj);
+            let src = compiler_file(builder, builder.cc(target), target, CLang::C, obj);
             let target = libdir_self_contained.join(obj);
             builder.copy(&src, &target);
             target_deps.push((target, DependencyType::TargetSelfContained));
@@ -690,6 +689,8 @@ pub fn rustc_cargo_env(builder: &Builder<'_>, cargo: &mut Cargo, target: TargetS
     }
 
     if builder.config.rustc_parallel {
+        // keep in sync with `bootstrap/lib.rs:Build::rustc_features`
+        // `cfg` option for rustc, `features` option for cargo, for conditional compilation
         cargo.rustflag("--cfg=parallel_compiler");
         cargo.rustdocflag("--cfg=parallel_compiler");
     }
@@ -702,7 +703,7 @@ pub fn rustc_cargo_env(builder: &Builder<'_>, cargo: &mut Cargo, target: TargetS
     //
     // Note that this is disabled if LLVM itself is disabled or we're in a check
     // build. If we are in a check build we still go ahead here presuming we've
-    // detected that LLVM is alreay built and good to go which helps prevent
+    // detected that LLVM is already built and good to go which helps prevent
     // busting caches (e.g. like #71152).
     if builder.config.llvm_enabled()
         && (builder.kind != Kind::Check
@@ -727,7 +728,13 @@ pub fn rustc_cargo_env(builder: &Builder<'_>, cargo: &mut Cargo, target: TargetS
             && !target.contains("msvc")
             && !target.contains("apple")
         {
-            let file = compiler_file(builder, builder.cxx(target).unwrap(), target, "libstdc++.a");
+            let file = compiler_file(
+                builder,
+                builder.cxx(target).unwrap(),
+                target,
+                CLang::Cxx,
+                "libstdc++.a",
+            );
             cargo.env("LLVM_STATIC_STDCPP", file);
         }
         if builder.config.llvm_link_shared {
@@ -948,10 +955,11 @@ pub fn compiler_file(
     builder: &Builder<'_>,
     compiler: &Path,
     target: TargetSelection,
+    c: CLang,
     file: &str,
 ) -> PathBuf {
     let mut cmd = Command::new(compiler);
-    cmd.args(builder.cflags(target, GitRepo::Rustc));
+    cmd.args(builder.cflags(target, GitRepo::Rustc, c));
     cmd.arg(format!("-print-file-name={}", file));
     let out = output(&mut cmd);
     PathBuf::from(out.trim())
@@ -1179,7 +1187,7 @@ impl Step for Assemble {
                 for tool in LLVM_TOOLS {
                     let tool_exe = exe(tool, target_compiler.host);
                     let src_path = llvm_bin_dir.join(&tool_exe);
-                    // When using `donwload-ci-llvm`, some of the tools
+                    // When using `download-ci-llvm`, some of the tools
                     // may not exist, so skip trying to copy them.
                     if src_path.exists() {
                         builder.copy(&src_path, &libdir_bin.join(&tool_exe));

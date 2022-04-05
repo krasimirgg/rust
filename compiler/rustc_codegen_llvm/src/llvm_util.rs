@@ -61,8 +61,8 @@ unsafe fn configure_llvm(sess: &Session) {
         full_arg.trim().split(|c: char| c == '=' || c.is_whitespace()).next().unwrap_or("")
     }
 
-    let cg_opts = sess.opts.cg.llvm_args.iter();
-    let tg_opts = sess.target.llvm_args.iter();
+    let cg_opts = sess.opts.cg.llvm_args.iter().map(AsRef::as_ref);
+    let tg_opts = sess.target.llvm_args.iter().map(AsRef::as_ref);
     let sess_args = cg_opts.chain(tg_opts);
 
     let user_specified_args: FxHashSet<_> =
@@ -187,9 +187,6 @@ pub fn to_llvm_features<'a>(sess: &Session, s: &'a str) -> SmallVec<[&'a str; 2]
         ("x86", "avx512vaes") => smallvec!["vaes"],
         ("x86", "avx512gfni") => smallvec!["gfni"],
         ("x86", "avx512vpclmulqdq") => smallvec!["vpclmulqdq"],
-        ("aarch64", "fp") => smallvec!["fp-armv8"],
-        ("aarch64", "fp16") => smallvec!["fullfp16"],
-        ("aarch64", "fhm") => smallvec!["fp16fml"],
         ("aarch64", "rcpc2") => smallvec!["rcpc-immo"],
         ("aarch64", "dpb") => smallvec!["ccpp"],
         ("aarch64", "dpb2") => smallvec!["ccdp"],
@@ -198,6 +195,19 @@ pub fn to_llvm_features<'a>(sess: &Session, s: &'a str) -> SmallVec<[&'a str; 2]
         ("aarch64", "pmuv3") => smallvec!["perfmon"],
         ("aarch64", "paca") => smallvec!["pauth"],
         ("aarch64", "pacg") => smallvec!["pauth"],
+        // Rust ties fp and neon together. In LLVM neon implicitly enables fp,
+        // but we manually enable neon when a feature only implicitly enables fp
+        ("aarch64", "f32mm") => smallvec!["f32mm", "neon"],
+        ("aarch64", "f64mm") => smallvec!["f64mm", "neon"],
+        ("aarch64", "fhm") => smallvec!["fp16fml", "neon"],
+        ("aarch64", "fp16") => smallvec!["fullfp16", "neon"],
+        ("aarch64", "jsconv") => smallvec!["jsconv", "neon"],
+        ("aarch64", "sve") => smallvec!["sve", "neon"],
+        ("aarch64", "sve2") => smallvec!["sve2", "neon"],
+        ("aarch64", "sve2-aes") => smallvec!["sve2-aes", "neon"],
+        ("aarch64", "sve2-sm4") => smallvec!["sve2-sm4", "neon"],
+        ("aarch64", "sve2-sha3") => smallvec!["sve2-sha3", "neon"],
+        ("aarch64", "sve2-bitperm") => smallvec!["sve2-bitperm", "neon"],
         (_, s) => smallvec![s],
     }
 }
@@ -219,6 +229,8 @@ pub fn check_tied_features(
     None
 }
 
+// Used to generate cfg variables and apply features
+// Must express features in the way Rust understands them
 pub fn target_features(sess: &Session) -> Vec<Symbol> {
     let target_machine = create_informational_target_machine(sess);
     let mut features: Vec<Symbol> =
@@ -228,13 +240,14 @@ pub fn target_features(sess: &Session) -> Vec<Symbol> {
                 if sess.is_nightly_build() || gate.is_none() { Some(feature) } else { None }
             })
             .filter(|feature| {
+                // check that all features in a given smallvec are enabled
                 for llvm_feature in to_llvm_features(sess, feature) {
                     let cstr = SmallCStr::new(llvm_feature);
-                    if unsafe { llvm::LLVMRustHasFeature(target_machine, cstr.as_ptr()) } {
-                        return true;
+                    if !unsafe { llvm::LLVMRustHasFeature(target_machine, cstr.as_ptr()) } {
+                        return false;
                     }
                 }
-                false
+                true
             })
             .map(|feature| Symbol::intern(feature))
             .collect();
@@ -362,19 +375,21 @@ fn handle_native(name: &str) -> &str {
 }
 
 pub fn target_cpu(sess: &Session) -> &str {
-    let name = sess.opts.cg.target_cpu.as_ref().unwrap_or(&sess.target.cpu);
-    handle_native(name)
+    match sess.opts.cg.target_cpu {
+        Some(ref name) => handle_native(name),
+        None => handle_native(sess.target.cpu.as_ref()),
+    }
 }
 
 /// The list of LLVM features computed from CLI flags (`-Ctarget-cpu`, `-Ctarget-feature`,
 /// `--target` and similar).
 pub(crate) fn global_llvm_features(sess: &Session, diagnostics: bool) -> Vec<String> {
-    // Features that come earlier are overriden by conflicting features later in the string.
+    // Features that come earlier are overridden by conflicting features later in the string.
     // Typically we'll want more explicit settings to override the implicit ones, so:
     //
-    // * Features from -Ctarget-cpu=*; are overriden by [^1]
-    // * Features implied by --target; are overriden by
-    // * Features from -Ctarget-feature; are overriden by
+    // * Features from -Ctarget-cpu=*; are overridden by [^1]
+    // * Features implied by --target; are overridden by
+    // * Features from -Ctarget-feature; are overridden by
     // * function specific features.
     //
     // [^1]: target-cpu=native is handled here, other target-cpu values are handled implicitly
@@ -383,7 +398,7 @@ pub(crate) fn global_llvm_features(sess: &Session, diagnostics: bool) -> Vec<Str
     // FIXME(nagisa): it isn't clear what's the best interaction between features implied by
     // `-Ctarget-cpu` and `--target` are. On one hand, you'd expect CLI arguments to always
     // override anything that's implicit, so e.g. when there's no `--target` flag, features implied
-    // the host target are overriden by `-Ctarget-cpu=*`. On the other hand, what about when both
+    // the host target are overridden by `-Ctarget-cpu=*`. On the other hand, what about when both
     // `--target` and `-Ctarget-cpu=*` are specified? Both then imply some target features and both
     // flags are specified by the user on the CLI. It isn't as clear-cut which order of precedence
     // should be taken in cases like these.
@@ -490,7 +505,7 @@ pub(crate) fn global_llvm_features(sess: &Session, diagnostics: bool) -> Vec<Str
         if RUSTC_SPECIFIC_FEATURES.contains(&feature) {
             return SmallVec::<[_; 2]>::new();
         }
-        // ... otherwise though we run through `to_llvm_feature when
+        // ... otherwise though we run through `to_llvm_features` when
         // passing requests down to LLVM. This means that all in-language
         // features also work on the command line instead of having two
         // different names when the LLVM name and the Rust name differ.
@@ -527,8 +542,9 @@ pub(crate) fn should_use_new_llvm_pass_manager(user_opt: &Option<bool>, target_a
     // The new pass manager is enabled by default for LLVM >= 13.
     // This matches Clang, which also enables it since Clang 13.
 
-    // FIXME: There are some perf issues with the new pass manager
-    // when targeting s390x, so it is temporarily disabled for that
-    // arch, see https://github.com/rust-lang/rust/issues/89609
-    user_opt.unwrap_or_else(|| target_arch != "s390x" && llvm_util::get_version() >= (13, 0, 0))
+    // There are some perf issues with the new pass manager when targeting
+    // s390x with LLVM 13, so enable the new pass manager only with LLVM 14.
+    // See https://github.com/rust-lang/rust/issues/89609.
+    let min_version = if target_arch == "s390x" { 14 } else { 13 };
+    user_opt.unwrap_or_else(|| llvm_util::get_version() >= (min_version, 0, 0))
 }

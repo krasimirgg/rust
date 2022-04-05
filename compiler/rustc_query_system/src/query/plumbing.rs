@@ -15,7 +15,7 @@ use rustc_data_structures::profiling::TimingGuard;
 use rustc_data_structures::sharded::Sharded;
 use rustc_data_structures::sync::Lock;
 use rustc_data_structures::thin_vec::ThinVec;
-use rustc_errors::{DiagnosticBuilder, ErrorReported, FatalError};
+use rustc_errors::{DiagnosticBuilder, ErrorGuaranteed, FatalError};
 use rustc_session::Session;
 use rustc_span::{Span, DUMMY_SP};
 use std::cell::Cell;
@@ -118,7 +118,7 @@ where
 fn mk_cycle<CTX, V, R>(
     tcx: CTX,
     error: CycleError,
-    handle_cycle_error: fn(CTX, DiagnosticBuilder<'_, ErrorReported>) -> V,
+    handle_cycle_error: fn(CTX, DiagnosticBuilder<'_, ErrorGuaranteed>) -> V,
     cache: &dyn crate::query::QueryStorage<Value = V, Stored = R>,
 ) -> R
 where
@@ -620,8 +620,8 @@ fn incremental_verify_ich_cold(sess: &Session, dep_node: DebugArg<'_>, result: D
     } else {
         sess.struct_err(&format!("internal compiler error: encountered incremental compilation error with {:?}", dep_node))
                 .help(&format!("This is a known issue with the compiler. Run {} to allow your project to compile", run_cmd))
-                .note(&"Please follow the instructions below to create a bug report with the provided information")
-                .note(&"See <https://github.com/rust-lang/rust/issues/84970> for more information")
+                .note("Please follow the instructions below to create a bug report with the provided information")
+                .note("See <https://github.com/rust-lang/rust/issues/84970> for more information")
                 .emit();
         panic!("Found unstable fingerprints for {:?}: {:?}", dep_node, result);
     }

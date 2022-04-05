@@ -2,9 +2,9 @@ use super::FnCtxt;
 use crate::astconv::AstConv;
 
 use rustc_ast::util::parser::ExprPrecedence;
-use rustc_span::{self, MultiSpan, Span};
+use rustc_span::{self, Span};
 
-use rustc_errors::{Applicability, Diagnostic};
+use rustc_errors::{Applicability, Diagnostic, MultiSpan};
 use rustc_hir as hir;
 use rustc_hir::def::{CtorOf, DefKind};
 use rustc_hir::lang_items::LangItem;
@@ -398,7 +398,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         let pin_box_found = self.tcx.mk_lang_item(box_found, LangItem::Pin).unwrap();
         let pin_found = self.tcx.mk_lang_item(found, LangItem::Pin).unwrap();
         match expected.kind() {
-            ty::Adt(def, _) if Some(def.did) == pin_did => {
+            ty::Adt(def, _) if Some(def.did()) == pin_did => {
                 if self.can_coerce(pin_box_found, expected) {
                     debug!("can coerce {:?} to {:?}, suggesting Box::pin", pin_box_found, expected);
                     match found.kind() {
@@ -521,6 +521,8 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         can_suggest: bool,
         fn_id: hir::HirId,
     ) -> bool {
+        let found =
+            self.resolve_numeric_literals_with_default(self.resolve_vars_if_possible(found));
         // Only suggest changing the return type for methods that
         // haven't set a return type at all (and aren't `fn main()` or an impl).
         match (&fn_decl.output, found.is_suggestable(), can_suggest, expected.is_unit()) {
@@ -528,13 +530,20 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 err.span_suggestion(
                     span,
                     "try adding a return type",
-                    format!("-> {} ", self.resolve_vars_with_obligations(found)),
+                    format!("-> {} ", found),
                     Applicability::MachineApplicable,
                 );
                 true
             }
             (&hir::FnRetTy::DefaultReturn(span), false, true, true) => {
-                err.span_label(span, "possibly return type missing here?");
+                // FIXME: if `found` could be `impl Iterator` or `impl Fn*`, we should suggest
+                // that.
+                err.span_suggestion(
+                    span,
+                    "a return type might be missing here",
+                    "-> _ ".to_string(),
+                    Applicability::HasPlaceholders,
+                );
                 true
             }
             (&hir::FnRetTy::DefaultReturn(span), _, false, true) => {
@@ -754,6 +763,77 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         if let Some(sp) = self.tcx.sess.parse_sess.ambiguous_block_expr_parse.borrow().get(&sp) {
             // `{ 42 } &&x` (#61475) or `{ 42 } && if x { 1 } else { 0 }`
             self.tcx.sess.parse_sess.expr_parentheses_needed(err, *sp);
+        }
+    }
+
+    /// Given an expression type mismatch, peel any `&` expressions until we get to
+    /// a block expression, and then suggest replacing the braces with square braces
+    /// if it was possibly mistaken array syntax.
+    pub(crate) fn suggest_block_to_brackets_peeling_refs(
+        &self,
+        diag: &mut Diagnostic,
+        mut expr: &hir::Expr<'_>,
+        mut expr_ty: Ty<'tcx>,
+        mut expected_ty: Ty<'tcx>,
+    ) {
+        loop {
+            match (&expr.kind, expr_ty.kind(), expected_ty.kind()) {
+                (
+                    hir::ExprKind::AddrOf(_, _, inner_expr),
+                    ty::Ref(_, inner_expr_ty, _),
+                    ty::Ref(_, inner_expected_ty, _),
+                ) => {
+                    expr = *inner_expr;
+                    expr_ty = *inner_expr_ty;
+                    expected_ty = *inner_expected_ty;
+                }
+                (hir::ExprKind::Block(blk, _), _, _) => {
+                    self.suggest_block_to_brackets(diag, *blk, expr_ty, expected_ty);
+                    break;
+                }
+                _ => break,
+            }
+        }
+    }
+
+    /// Suggest wrapping the block in square brackets instead of curly braces
+    /// in case the block was mistaken array syntax, e.g. `{ 1 }` -> `[ 1 ]`.
+    pub(crate) fn suggest_block_to_brackets(
+        &self,
+        diag: &mut Diagnostic,
+        blk: &hir::Block<'_>,
+        blk_ty: Ty<'tcx>,
+        expected_ty: Ty<'tcx>,
+    ) {
+        if let ty::Slice(elem_ty) | ty::Array(elem_ty, _) = expected_ty.kind() {
+            if self.can_coerce(blk_ty, *elem_ty)
+                && blk.stmts.is_empty()
+                && blk.rules == hir::BlockCheckMode::DefaultBlock
+            {
+                let source_map = self.tcx.sess.source_map();
+                if let Ok(snippet) = source_map.span_to_snippet(blk.span) {
+                    if snippet.starts_with('{') && snippet.ends_with('}') {
+                        diag.multipart_suggestion_verbose(
+                            "to create an array, use square brackets instead of curly braces",
+                            vec![
+                                (
+                                    blk.span
+                                        .shrink_to_lo()
+                                        .with_hi(rustc_span::BytePos(blk.span.lo().0 + 1)),
+                                    "[".to_string(),
+                                ),
+                                (
+                                    blk.span
+                                        .shrink_to_hi()
+                                        .with_lo(rustc_span::BytePos(blk.span.hi().0 - 1)),
+                                    "]".to_string(),
+                                ),
+                            ],
+                            Applicability::MachineApplicable,
+                        );
+                    }
+                }
+            }
         }
     }
 

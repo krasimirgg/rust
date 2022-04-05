@@ -1,13 +1,14 @@
 use crate::structured_errors::StructuredDiagnostic;
 use rustc_errors::{
-    pluralize, Applicability, Diagnostic, DiagnosticBuilder, DiagnosticId, ErrorReported,
+    pluralize, Applicability, Diagnostic, DiagnosticBuilder, DiagnosticId, ErrorGuaranteed,
+    MultiSpan,
 };
 use rustc_hir as hir;
 use rustc_middle::hir::map::fn_sig;
 use rustc_middle::middle::resolve_lifetime::LifetimeScopeForPath;
 use rustc_middle::ty::{self as ty, TyCtxt};
 use rustc_session::Session;
-use rustc_span::{def_id::DefId, MultiSpan};
+use rustc_span::def_id::DefId;
 
 use GenericArgsInfo::*;
 
@@ -323,7 +324,7 @@ impl<'a, 'tcx> WrongNumberOfGenericArgs<'a, 'tcx> {
             .skip(self.params_offset + self.num_provided_type_or_const_args())
             .take(num_params_to_take)
             .map(|param| match param.kind {
-                // This is being infered from the item's inputs, no need to set it.
+                // This is being inferred from the item's inputs, no need to set it.
                 ty::GenericParamDefKind::Type { .. } if is_used_in_input(param.def_id) => {
                     "_".to_string()
                 }
@@ -374,7 +375,7 @@ impl<'a, 'tcx> WrongNumberOfGenericArgs<'a, 'tcx> {
         }
     }
 
-    fn start_diagnostics(&self) -> DiagnosticBuilder<'tcx, ErrorReported> {
+    fn start_diagnostics(&self) -> DiagnosticBuilder<'tcx, ErrorGuaranteed> {
         let span = self.path_segment.ident.span;
         let msg = self.create_error_message();
 
@@ -484,7 +485,7 @@ impl<'a, 'tcx> WrongNumberOfGenericArgs<'a, 'tcx> {
         let msg = format!("add missing {} argument{}", self.kind(), pluralize!(num_missing_args));
 
         // we first try to get lifetime name suggestions from scope or elision information. If none is
-        // available we use the parameter defintions
+        // available we use the parameter definitions
         let suggested_args = if let Some(hir_id) = self.path_segment.hir_id {
             if let Some(lifetimes_in_scope) = self.tcx.lifetime_scope(hir_id) {
                 match lifetimes_in_scope {
@@ -587,7 +588,7 @@ impl<'a, 'tcx> WrongNumberOfGenericArgs<'a, 'tcx> {
                     (gen_args_span.shrink_to_lo(), true)
                 } else {
                     let arg_span = self.gen_args.args[sugg_offset - 1].span();
-                    // If we came here then inferred lifetimes's spans can only point
+                    // If we came here then inferred lifetime's spans can only point
                     // to either the opening bracket or to the space right after.
                     // Both of these spans have an `hi` lower than or equal to the span
                     // of the generics excluding the brackets.
@@ -657,10 +658,9 @@ impl<'a, 'tcx> WrongNumberOfGenericArgs<'a, 'tcx> {
 
             let num_redundant_lt_args = lt_arg_spans.len() - self.num_expected_lifetime_args();
             let msg_lifetimes = format!(
-                "remove {} {} argument{}",
-                if num_redundant_lt_args == 1 { "this" } else { "these" },
-                "lifetime",
-                pluralize!(num_redundant_lt_args),
+                "remove {these} lifetime argument{s}",
+                these = pluralize!("this", num_redundant_lt_args),
+                s = pluralize!(num_redundant_lt_args),
             );
 
             err.span_suggestion(
@@ -700,10 +700,9 @@ impl<'a, 'tcx> WrongNumberOfGenericArgs<'a, 'tcx> {
             let num_redundant_gen_args =
                 gen_arg_spans.len() - self.num_expected_type_or_const_args();
             let msg_types_or_consts = format!(
-                "remove {} {} argument{}",
-                if num_redundant_gen_args == 1 { "this" } else { "these" },
-                "generic",
-                pluralize!(num_redundant_type_or_const_args),
+                "remove {these} generic argument{s}",
+                these = pluralize!("this", num_redundant_gen_args),
+                s = pluralize!(num_redundant_gen_args),
             );
 
             err.span_suggestion(
@@ -810,7 +809,7 @@ impl<'tcx> StructuredDiagnostic<'tcx> for WrongNumberOfGenericArgs<'_, 'tcx> {
         rustc_errors::error_code!(E0107)
     }
 
-    fn diagnostic_common(&self) -> DiagnosticBuilder<'tcx, ErrorReported> {
+    fn diagnostic_common(&self) -> DiagnosticBuilder<'tcx, ErrorGuaranteed> {
         let mut err = self.start_diagnostics();
 
         self.notify(&mut err);

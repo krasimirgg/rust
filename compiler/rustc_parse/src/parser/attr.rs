@@ -139,7 +139,7 @@ impl<'a> Parser<'a> {
                 Ok(attr::mk_attr_from_item(item, None, style, attr_sp))
             } else {
                 let token_str = pprust::token_to_string(&this.token);
-                let msg = &format!("expected `#`, found `{}`", token_str);
+                let msg = &format!("expected `#`, found `{token_str}`");
                 Err(this.struct_span_err(this.token.span, msg))
             }
         })
@@ -151,7 +151,7 @@ impl<'a> Parser<'a> {
         span: Span,
         attr_type: OuterAttributeType,
     ) -> Option<Span> {
-        let mut snapshot = self.clone();
+        let mut snapshot = self.create_snapshot_for_diagnostic();
         let lo = span.lo()
             + BytePos(match attr_type {
                 OuterAttributeType::Attribute => 1,
@@ -304,7 +304,7 @@ impl<'a> Parser<'a> {
                 // this replace range with it, removing the inner attribute from the final
                 // `AttrAnnotatedTokenStream`. Inner attributes are stored in the parsed AST note.
                 // During macro expansion, they are selectively inserted back into the
-                // token stream (the first inner attribute is remoevd each time we invoke the
+                // token stream (the first inner attribute is removed each time we invoke the
                 // corresponding macro).
                 let range = start_pos..end_pos;
                 if let Capturing::Yes = self.capture_state.capturing {
@@ -421,7 +421,7 @@ impl<'a> Parser<'a> {
         }
 
         let found = pprust::token_to_string(&self.token);
-        let msg = format!("expected unsuffixed literal or identifier, found `{}`", found);
+        let msg = format!("expected unsuffixed literal or identifier, found `{found}`");
         Err(self.struct_span_err(self.token.span, &msg))
     }
 }

@@ -19,7 +19,7 @@ pub use pat::{CommaRecoveryMode, RecoverColon, RecoverComma};
 pub use path::PathStyle;
 
 use rustc_ast::ptr::P;
-use rustc_ast::token::{self, DelimToken, Token, TokenKind};
+use rustc_ast::token::{self, DelimToken, Nonterminal, Token, TokenKind};
 use rustc_ast::tokenstream::AttributesData;
 use rustc_ast::tokenstream::{self, DelimSpan, Spacing};
 use rustc_ast::tokenstream::{TokenStream, TokenTree};
@@ -32,9 +32,11 @@ use rustc_ast_pretty::pprust;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_data_structures::sync::Lrc;
 use rustc_errors::PResult;
-use rustc_errors::{struct_span_err, Applicability, DiagnosticBuilder, ErrorReported, FatalError};
+use rustc_errors::{
+    struct_span_err, Applicability, DiagnosticBuilder, ErrorGuaranteed, FatalError, MultiSpan,
+};
 use rustc_session::parse::ParseSess;
-use rustc_span::source_map::{MultiSpan, Span, DUMMY_SP};
+use rustc_span::source_map::{Span, DUMMY_SP};
 use rustc_span::symbol::{kw, sym, Ident, Symbol};
 use tracing::debug;
 
@@ -148,7 +150,7 @@ pub struct Parser<'a> {
     pub current_closure: Option<ClosureSpans>,
 }
 
-/// Stores span informations about a closure.
+/// Stores span information about a closure.
 #[derive(Clone)]
 pub struct ClosureSpans {
     pub whole_closure: Span,
@@ -204,8 +206,9 @@ struct TokenCursor {
     frame: TokenCursorFrame,
     stack: Vec<TokenCursorFrame>,
     desugar_doc_comments: bool,
-    // Counts the number of calls to `next` or `next_desugared`,
-    // depending on whether `desugar_doc_comments` is set.
+    // Counts the number of calls to `{,inlined_}next` or
+    // `{,inlined_}next_desugared`, depending on whether
+    // `desugar_doc_comments` is set.
     num_next_calls: usize,
     // During parsing, we may sometimes need to 'unglue' a
     // glued token into two component tokens
@@ -254,6 +257,12 @@ impl TokenCursorFrame {
 
 impl TokenCursor {
     fn next(&mut self) -> (Token, Spacing) {
+        self.inlined_next()
+    }
+
+    /// This always-inlined version should only be used on hot code paths.
+    #[inline(always)]
+    fn inlined_next(&mut self) -> (Token, Spacing) {
         loop {
             let (tree, spacing) = if !self.frame.open_delim {
                 self.frame.open_delim = true;
@@ -283,7 +292,13 @@ impl TokenCursor {
     }
 
     fn next_desugared(&mut self) -> (Token, Spacing) {
-        let (data, attr_style, sp) = match self.next() {
+        self.inlined_next_desugared()
+    }
+
+    /// This always-inlined version should only be used on hot code paths.
+    #[inline(always)]
+    fn inlined_next_desugared(&mut self) -> (Token, Spacing) {
+        let (data, attr_style, sp) = match self.inlined_next() {
             (Token { kind: token::DocComment(_, attr_style, data), span }, _) => {
                 (data, attr_style, span)
             }
@@ -461,12 +476,13 @@ impl<'a> Parser<'a> {
         parser
     }
 
+    #[inline]
     fn next_tok(&mut self, fallback_span: Span) -> (Token, Spacing) {
         loop {
             let (mut next, spacing) = if self.desugar_doc_comments {
-                self.token_cursor.next_desugared()
+                self.token_cursor.inlined_next_desugared()
             } else {
-                self.token_cursor.next()
+                self.token_cursor.inlined_next()
             };
             self.token_cursor.num_next_calls += 1;
             // We've retrieved an token from the underlying
@@ -877,7 +893,7 @@ impl<'a> Parser<'a> {
     fn recover_missing_braces_around_closure_body(
         &mut self,
         closure_spans: ClosureSpans,
-        mut expect_err: DiagnosticBuilder<'_, ErrorReported>,
+        mut expect_err: DiagnosticBuilder<'_, ErrorGuaranteed>,
     ) -> PResult<'a, ()> {
         let initial_semicolon = self.token.span;
 
@@ -996,7 +1012,13 @@ impl<'a> Parser<'a> {
     }
 
     /// Advance the parser by one token using provided token as the next one.
-    fn bump_with(&mut self, (next_token, next_spacing): (Token, Spacing)) {
+    fn bump_with(&mut self, next: (Token, Spacing)) {
+        self.inlined_bump_with(next)
+    }
+
+    /// This always-inlined version should only be used on hot code paths.
+    #[inline(always)]
+    fn inlined_bump_with(&mut self, (next_token, next_spacing): (Token, Spacing)) {
         // Bumping after EOF is a bad sign, usually an infinite loop.
         if self.prev_token.kind == TokenKind::Eof {
             let msg = "attempted to bump the parser past EOF (may be stuck in a loop)";
@@ -1014,7 +1036,7 @@ impl<'a> Parser<'a> {
     /// Advance the parser by one token.
     pub fn bump(&mut self) {
         let next_token = self.next_tok(self.token.span);
-        self.bump_with(next_token);
+        self.inlined_bump_with(next_token);
     }
 
     /// Look-ahead `dist` tokens of `self.token` and get access to that token there.
@@ -1429,7 +1451,7 @@ impl<'a> Parser<'a> {
 crate fn make_unclosed_delims_error(
     unmatched: UnmatchedBrace,
     sess: &ParseSess,
-) -> Option<DiagnosticBuilder<'_, ErrorReported>> {
+) -> Option<DiagnosticBuilder<'_, ErrorGuaranteed>> {
     // `None` here means an `Eof` was found. We already emit those errors elsewhere, we add them to
     // `unmatched_braces` only for error recovery in the `Parser`.
     let found_delim = unmatched.found_delim?;
@@ -1484,4 +1506,10 @@ pub enum FlatToken {
     /// to an `AttrAnnotatedTokenStream`. This is used to simplify the
     /// handling of replace ranges.
     Empty,
+}
+
+#[derive(Debug)]
+pub enum NtOrTt {
+    Nt(Nonterminal),
+    Tt(TokenTree),
 }
