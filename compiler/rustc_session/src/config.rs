@@ -1985,7 +1985,7 @@ fn parse_native_lib_kind(
                     "linking modifier can't be used with library kind `link-arg`",
                 )
             }
-            if !is_nightly {
+            if !nightly_options::match_is_nightly_build(matches) {
                 early_error(
                     error_format,
                     "library kind `link-arg` is currently unstable and only accepted on \

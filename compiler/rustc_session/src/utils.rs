@@ -54,7 +54,7 @@ impl NativeLibKind {
             NativeLibKind::Dylib { as_needed } | NativeLibKind::Framework { as_needed } => {
                 as_needed.is_some()
             }
-            NativeLibKind::RawDylib | NativeLibKind::Unspecified => false,
+            NativeLibKind::RawDylib | NativeLibKind::LinkArg | NativeLibKind::Unspecified => false,
         }
     }
 }
