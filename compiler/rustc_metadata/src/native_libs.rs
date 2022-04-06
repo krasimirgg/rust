@@ -260,6 +260,7 @@ impl<'tcx> ItemLikeVisitor<'tcx> for Collector<'tcx> {
 
 impl Collector<'_> {
     fn register_native_lib(&mut self, span: Option<Span>, lib: NativeLib) {
+        tracing::debug!("register_native_lib: span={:?} lib={:?}", &span, &lib);
         if lib.name.as_ref().map_or(false, |&s| s == kw::Empty) {
             match span {
                 Some(span) => {
@@ -273,7 +274,11 @@ impl Collector<'_> {
                     .emit();
                 }
                 None => {
-                    self.tcx.sess.err("empty library name given via `-l`");
+                    if lib.kind == NativeLibKind::LinkArg {
+                        self.libs.push(lib);
+                    } else {
+                        self.tcx.sess.err("empty library name given via `-l`");
+                    }
                 }
             }
             return;
